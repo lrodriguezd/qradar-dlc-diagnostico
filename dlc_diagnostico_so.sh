@@ -38,7 +38,7 @@
 #
 # AVISO / DISCLAIMER:
 #   Este script NO cuenta con soporte oficial de IBM. Es una herramienta de
-#   diagnostico de campo elaborada por rodiaz@mx1.ibm.com. Usarla bajo
+#   diagnostico de campo elaborada por lrodriguezd@outlook.com. Usarla bajo
 #   responsabilidad del operador y validar los hallazgos antes de actuar.
 #=============================================================================
 
@@ -205,7 +205,7 @@ DLC_UUID="${DLC_UUID%% }"
     echo "# Script    : dlc_diagnostico_so.sh (solo lectura)"
     echo "# AVISO     : Este script NO cuenta con soporte oficial de IBM."
     echo "#             Herramienta de diagnostico de campo elaborada por"
-    echo "#             rodiaz@mx1.ibm.com."
+    echo "#             lrodriguezd@outlook.com."
     echo "############################################################"
 } > "$INFORME"
 echo "Informe: $INFORME"
@@ -1277,7 +1277,7 @@ cat <<HTMLFOOT
  <li><b>soporte_ibm/dlc.tar.gz</b> &mdash; paquete oficial para IBM Support (TechNote 7274013), listo para adjuntar a un caso.</li>
 </ul>
 <p class="pie">Generado por dlc_diagnostico_so.sh (solo lectura, sin cambios al sistema). Los enlaces de evidencia funcionan al abrir el HTML desde el paquete descomprimido.<br>
-AVISO: este script no cuenta con soporte oficial de IBM. Herramienta de diagnostico de campo elaborada por rodiaz@mx1.ibm.com.</p>
+AVISO: este script no cuenta con soporte oficial de IBM. Herramienta de diagnostico de campo elaborada por lrodriguezd@outlook.com.</p>
 </body>
 </html>
 HTMLFOOT

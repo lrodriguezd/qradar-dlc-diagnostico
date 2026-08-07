@@ -2,7 +2,7 @@
 
 Script de diagnóstico en bash para instancias de **IBM Disconnected Log Collector (DLC)** sobre RHEL/CentOS que dejaron de enviar eventos a **IBM QRadar / QRadar on Cloud (QRoC)**. Ejecuta un conjunto ordenado de pruebas que deslindan si la causa está en el sistema operativo, la red, el propio DLC (servicio, certificados, TLS, CRLs, configuración) o en los log sources, y deja evidencia documentada de cada prueba.
 
-> **AVISO**: este script **no cuenta con soporte oficial de IBM**. Es una herramienta de diagnóstico de campo elaborada por rodiaz@mx1.ibm.com. Úsela bajo responsabilidad del operador y valide los hallazgos antes de actuar.
+> **AVISO**: este script **no cuenta con soporte oficial de IBM**. Es una herramienta de diagnóstico de campo elaborada por lrodriguezd@outlook.com. Úsela bajo responsabilidad del operador y valide los hallazgos antes de actuar.
 
 ## Características
 
