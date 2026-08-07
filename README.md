@@ -78,4 +78,4 @@ sudo ./dlc_diagnostico_so.sh \
 
 ## Licencia y contribuciones
 
-Uso bajo su propia responsabilidad. Se aceptan mejoras vía pull request; toda contribución debe mantener el carácter de solo lectura del diagnóstico y no incluir datos de clientes.
+Licencia MIT (ver [LICENSE](LICENSE)). Uso bajo su propia responsabilidad. Se aceptan mejoras vía pull request; toda contribución debe mantener el carácter de solo lectura del diagnóstico y no incluir datos de clientes.
