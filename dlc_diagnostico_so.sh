@@ -597,7 +597,7 @@ if [[ -n "$TLS_DEST" ]]; then
     fi
     if [[ -z "$TR_TOOL" ]]; then
         no_ejecutada 27_traceroute "Ruta TCP al EP" "no hay tcptraceroute, traceroute ni mtr instalados"
-    elif salida 27_traceroute | grep -qE "open|$TLS_DEST"; then
+    elif salida 27_traceroute | grep -vE '^traceroute to|Tracing the path|^Running' | grep -qE "open|$TLS_DEST"; then
         add_result 27_traceroute OK "Ruta TCP al EP ($TR_TOOL)" "La traza alcanza el destino $TLS_DEST:$DEST_PORT (ver saltos en la evidencia)."
     elif [[ "${V[24_conexion]:-}" == OK ]]; then
         add_result 27_traceroute INFO "Ruta TCP al EP ($TR_TOOL)" "La traza no muestra el salto final (comportamiento comun cuando el perimetro filtra las respuestas del trazado), pero la conectividad extremo a extremo esta confirmada por 24_conexion y 25_tls; no constituye hallazgo."
@@ -665,8 +665,11 @@ if command -v tcpdump >/dev/null 2>&1 && [[ -n "$TLS_DEST" ]]; then
     cap 32_saliente "Captura ${TCPDUMP_SEGUNDOS}s de trafico saliente hacia $TLS_DEST:$DEST_PORT" \
         "timeout $TCPDUMP_SEGUNDOS tcpdump -nn -i any -c 40 'dst host $TLS_DEST and port $DEST_PORT' 2>&1 | head -50"
     PKT_OUT=$(salida 32_saliente | grep -cE '^[0-9]{2}:[0-9]{2}')
-    if [[ "$PKT_OUT" -gt 0 ]]; then
-        add_result 32_saliente OK "El DLC envia trafico a QRoC" "$PKT_OUT paquetes hacia $TLS_DEST:$DEST_PORT en ${TCPDUMP_SEGUNDOS}s."
+    PKT_NOSYN=$(salida 32_saliente | grep -E '^[0-9]{2}:[0-9]{2}' | grep -vc 'Flags \[S\]')
+    if [[ "$PKT_OUT" -gt 0 && "$PKT_NOSYN" -eq 0 ]]; then
+        add_result 32_saliente FALLA "El DLC envia trafico a QRoC" "Se observan $PKT_OUT paquetes salientes pero TODOS son SYN sin respuesta: el DLC intenta conectar y el destino no contesta (correlacionar con 24_conexion y 27_traceroute; tipico de bloqueo perimetral o de allowlist)."
+    elif [[ "$PKT_OUT" -gt 0 ]]; then
+        add_result 32_saliente OK "El DLC envia trafico a QRoC" "$PKT_OUT paquetes hacia $TLS_DEST:$DEST_PORT en ${TCPDUMP_SEGUNDOS}s (incluye trafico de sesion, no solo SYN)."
     else
         add_result 32_saliente FALLA "El DLC envia trafico a QRoC" "0 paquetes salientes en ${TCPDUMP_SEGUNDOS}s: el DLC no esta transmitiendo. Nota: con volumen muy bajo y sin eventos entrantes (31), es posible que el DLC no tenga datos por transmitir durante la ventana de captura; interpretar en conjunto con 33_jmx."
     fi
