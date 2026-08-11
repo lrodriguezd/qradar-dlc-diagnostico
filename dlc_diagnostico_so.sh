@@ -1192,7 +1192,11 @@ if [[ -n "$RESPALDO_CFG" ]]; then
         fi
         BK_N=$(tar -tzf "$BK_FILE" 2>/dev/null | wc -l | tr -d ' ')
         if [[ "$BK_N" -gt 0 ]]; then
-            add_result 51_respaldo OK "Respaldo de configuracion" "$BK_FILE ($(du -h "$BK_FILE" 2>/dev/null | awk '{print $1}'), $BK_N entradas verificadas con tar -tzf; incluye conf, keystore, MKS, anclas CA y firewalld). IMPORTANTE: el respaldo reside en este mismo servidor; copiarlo FUERA antes de iniciar la ventana de cambio."
+            # El respaldo forma parte del entregable global: se copia dentro
+            # del paquete del diagnostico y se conserva el original local.
+            mkdir -p "$OUTDIR/respaldo_config"
+            cp -p "$BK_FILE" "$OUTDIR/respaldo_config/" 2>/dev/null
+            add_result 51_respaldo OK "Respaldo de configuracion" "$BK_FILE ($(du -h "$BK_FILE" 2>/dev/null | awk '{print $1}'), $BK_N entradas verificadas con tar -tzf; incluye conf, keystore, MKS, anclas CA y firewalld). Incluido en el paquete final del diagnostico (respaldo_config/) y conservado el original en /store/tmp. IMPORTANTE: llevar el paquete final FUERA del servidor antes de iniciar la ventana de cambio."
         else
             add_result 51_respaldo FALLA "Respaldo de configuracion" "El archivo $BK_FILE existe pero no lista contenido valido (tar -tzf fallo): NO iniciar la ventana con este respaldo."
         fi
@@ -1357,6 +1361,7 @@ cat <<HTMLFOOT
  <li><b>informe.html</b> &mdash; este informe preliminar.</li>
  <li><b>evidencias/</b> &mdash; un archivo .txt por prueba, con el comando ejecutado y su salida cruda.</li>
  <li><b>soporte_ibm/dlc.tar.gz</b> &mdash; paquete oficial para IBM Support (TechNote 7274013), listo para adjuntar a un caso.</li>
+$( [[ -n "${BK_FILE:-}" ]] && echo ' <li><b>respaldo_config/</b> &mdash; respaldo de configuracion del DLC (configBackup oficial o equivalente), verificado con tar -tzf.</li>' )
 </ul>
 <p class="pie">Generado por dlc_diagnostico_so.sh (solo lectura, sin cambios al sistema). Los enlaces de evidencia funcionan al abrir el HTML desde el paquete descomprimido.<br>
 AVISO: este script no cuenta con soporte oficial de IBM. Herramienta de diagnostico de campo elaborada por lrodriguezd@outlook.com.</p>
@@ -1391,7 +1396,7 @@ echo "============================================================"
 echo " Diagnostico terminado."
 echo " PAQUETE FINAL : $RES_PAQ"
 echo " Limpieza      : $LIMPIEZA"
-[[ -n "$BK_FILE" ]] && echo " Respaldo cfg  : $BK_FILE  (copiarlo FUERA del servidor)"
+[[ -n "$BK_FILE" ]] && echo " Respaldo cfg  : INCLUIDO en el paquete final (respaldo_config/); original en $BK_FILE"
 echo " Para revisar  : tar -xzf $PAQUETE"
 echo "   Contiene: informe.txt, informe.html, evidencias/ (un .txt"
 echo "   por prueba) y soporte_ibm/dlc.tar.gz (TechNote 7274013)."

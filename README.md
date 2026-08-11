@@ -67,7 +67,7 @@ sudo ./dlc_diagnostico_so.sh \
 sudo ./dlc_diagnostico_so.sh -b
 ```
 
-Conservar el `.tgz` del diagnóstico (línea base) y **copiar el respaldo de configuración fuera del servidor** (reside en `/store/tmp/` del propio host). Complementar con snapshot de la VM, y verificar `systemctl is-enabled dlc` y `/store` en `/etc/fstab`.
+El respaldo de configuración verificado queda **incluido dentro del `.tgz` del diagnóstico** (carpeta `respaldo_config/`), con el original conservado en `/store/tmp/` — llevar el `.tgz` fuera del servidor cubre ambos entregables en un solo archivo. Complementar con snapshot de la VM, y verificar `systemctl is-enabled dlc` y `/store` en `/etc/fstab`.
 
 **Después de la ventana** (y del reinicio si aplicó kernel): ejecutar de nuevo el script y comparar contra la línea base — el bloque 5 documenta las versiones antes/después de cada paquete y señala si el parcheo tocó componentes sensibles (Java, openssl, crypto-policies, firewalld, SELinux, kernel). Cerrar validando en la consola de QRoC que eventos y health metrics continúan llegando.
 
