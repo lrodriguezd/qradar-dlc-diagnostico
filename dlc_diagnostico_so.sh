@@ -1183,7 +1183,10 @@ if [[ -n "$RESPALDO_CFG" ]]; then
              tar -czf \"\$BK\" '$DLC_HOME/MKS' '$DLC_HOME/keystore' '$DLC_HOME/trusted_certificates' '$DLC_HOME/conf' /store/ec /etc/dlc/instance /etc/pki/ca-trust/source/anchors '$DLC_HOME/current/eventgnosis/config/' /etc/firewalld/zones /etc/firewalld/services/ 2>&1 | tail -3;
              echo \"Configuration has been backed up to file \$BK\""
     fi
-    BK_FILE=$(find /store/tmp -maxdepth 1 -name 'dlc_config_backup_*' -type f -mmin -15 2>/dev/null | sort | tail -1)
+    # Se toma el archivo EXACTO reportado por la ejecucion que acaba de
+    # correr (linea "backed up to file" del configBackup oficial o del
+    # equivalente); no se busca ningun respaldo preexistente en el servidor.
+    BK_FILE=$(salida 51_respaldo | grep -m1 'backed up to file' | sed 's/.*backed up to file[[:space:]]*//; s/^ *//; s/ *$//')
     if [[ -n "$BK_FILE" && -s "$BK_FILE" ]]; then
         # Mejora: nombre portable (los dos puntos son invalidos en Windows)
         BK_SAFE="${BK_FILE//:/-}"
@@ -1201,7 +1204,7 @@ if [[ -n "$RESPALDO_CFG" ]]; then
             add_result 51_respaldo FALLA "Respaldo de configuracion" "El archivo $BK_FILE existe pero no lista contenido valido (tar -tzf fallo): NO iniciar la ventana con este respaldo."
         fi
     else
-        add_result 51_respaldo FALLA "Respaldo de configuracion" "No se genero el archivo de respaldo en /store/tmp (ver evidencias/51_respaldo.txt). NO iniciar la ventana sin respaldo verificado."
+        add_result 51_respaldo FALLA "Respaldo de configuracion" "La ejecucion del respaldo no reporto un archivo generado, o el archivo reportado no existe o esta vacio (ver evidencias/51_respaldo.txt). NO iniciar la ventana sin un respaldo verificado."
     fi
 fi
 
