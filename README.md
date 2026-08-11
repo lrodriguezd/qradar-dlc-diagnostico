@@ -6,7 +6,8 @@ Script de diagnóstico en bash para instancias de **IBM Disconnected Log Collect
 
 ## Características
 
-- **Solo lectura**: no reinicia servicios ni modifica configuración, firewall o certificados. Única excepción: una escritura de prueba de 4 KB en `/store` (O_DIRECT/fsync) que se elimina al terminar — detecta el caso real de un disco virtual desconectado donde el permiso aparente se ve bien pero nada persiste.
+- **Sin cambios al sistema**: no reinicia servicios ni modifica configuración, firewall o certificados. Escrituras legítimas: una prueba de 4 KB en `/store` (O_DIRECT/fsync, se elimina al terminar) y el archivo de respaldo de configuración en `/store/tmp`.
+- **Respaldo de configuración en cada ejecución** (prueba 51): usa el `configBackup.sh` oficial de IBM (o un equivalente con las mismas rutas), verifica el contenido con `tar -tzf`, normaliza el nombre a formato portable y lo integra al paquete final (`respaldo_config/`).
 - **Veredictos accionables**: cada prueba concluye OK / FALLA / ALERTA / INFO. Una prueba que no puede ejecutarse (comando faltante) se marca FALLA como "no ejecutada" — un diagnóstico incompleto también es un hallazgo.
 - **Evidencia completa**: un archivo `.txt` por prueba con el comando ejecutado, la fecha y la salida cruda.
 - **Informe en texto y HTML** con análisis cruzado final que indica a qué capa apunta la evidencia.
@@ -44,7 +45,6 @@ sudo ./dlc_diagnostico_so.sh \
 | `-d <destino>` | IP o FQDN destino manual (prioridad sobre config.json) |
 | `-p <puerto>` | Puerto destino manual (prioridad sobre config.json) |
 | `-P <puerto>` | Puerto esperado para la comparación (por defecto 32500; en QRoC no debe cambiarse) |
-| `-b` | Ejecuta además el respaldo de configuración del DLC (usa el `configBackup.sh` oficial, o un equivalente con las mismas rutas), verifica el contenido con `tar -tzf` y normaliza el nombre a formato portable |
 | `-h` | Ayuda |
 
 ## Pruebas incluidas
@@ -61,10 +61,10 @@ sudo ./dlc_diagnostico_so.sh \
 
 ## Uso en ventanas de actualización del servidor
 
-**Antes de la ventana** — una sola ejecución genera la línea base y el respaldo verificado:
+**Antes de la ventana** — una sola ejecución genera la línea base y el respaldo verificado (el respaldo forma parte de toda ejecución):
 
 ```bash
-sudo ./dlc_diagnostico_so.sh -b
+sudo ./dlc_diagnostico_so.sh
 ```
 
 El respaldo de configuración verificado queda **incluido dentro del `.tgz` del diagnóstico** (carpeta `respaldo_config/`), con el original conservado en `/store/tmp/` — llevar el `.tgz` fuera del servidor cubre ambos entregables en un solo archivo. Complementar con snapshot de la VM, y verificar `systemctl is-enabled dlc` y `/store` en `/etc/fstab`.

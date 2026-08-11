@@ -21,14 +21,13 @@
 #   elimina al terminar para no ocupar espacio.
 #
 # Uso:   sudo ./dlc_diagnostico_so.sh [-e fqdn_ep1] [-f fqdn_ep2] [-i ip_ep1]
-#          [-j ip_ep2] [-d destino] [-p puerto] [-P puerto_esperado] [-b] [-h]
+#          [-j ip_ep2] [-d destino] [-p puerto] [-P puerto_esperado] [-h]
 #
-#   -b agrega el RESPALDO DE CONFIGURACION del DLC (configBackup.sh oficial,
-#      o un equivalente con las mismas rutas si no existe), con verificacion
-#      de contenido y nombre de archivo portable. Pensado para ejecutar una
-#      sola corrida antes de una ventana de actualizacion: diagnostico
-#      (linea base) + respaldo verificado. Unica escritura adicional: el
-#      archivo de respaldo en /store/tmp.
+# Cada ejecucion incluye el RESPALDO DE CONFIGURACION del DLC (bloque 7,
+# prueba 51): usa el configBackup.sh oficial de IBM o un equivalente con las
+# mismas rutas, verifica el contenido, normaliza el nombre a formato portable
+# y lo integra al paquete final (respaldo_config/). Escrituras legitimas del
+# script: la prueba de 4 KB en /store y el archivo de respaldo en /store/tmp.
 #
 # MODOS DE EJECUCION:
 #   1) Autonomo (sin opciones): el script lee el destino real del config.json
@@ -78,8 +77,6 @@ PUERTO_MANUAL=""   # puerto a probar
 # En QRadar on Cloud debe permanecer en 32500 (no debe cambiarse).
 PUERTO_ESPERADO="32500"
 
-# Respaldo de configuracion (bloque 7): vacio = no ejecutar; "si" o flag -b.
-RESPALDO_CFG=""
 
 # Certificado firmado y cadena completa dentro de keystore/<UUID>/: por
 # defecto se AUTODETECTAN por contenido, dado que cada despliegue los nombra
@@ -109,10 +106,10 @@ Uso: sudo ./dlc_diagnostico_so.sh [opciones]   (ejecutar como root en el DLC)
   -d <destino> IP o FQDN destino manual (prioridad sobre config.json)
   -p <puerto>  Puerto destino manual (prioridad sobre config.json)
   -P <puerto>  Puerto esperado para la comparacion (por defecto 32500)
-  -b           Ejecuta ademas el respaldo de configuracion del DLC
-               (configBackup.sh oficial o equivalente), con verificacion.
-               Recomendado antes de una ventana de actualizacion.
   -h           Muestra esta ayuda
+
+Cada ejecucion incluye el respaldo de configuracion del DLC (prueba 51),
+verificado e integrado al paquete final.
 
 Modos de ejecucion:
   Autonomo (sin opciones): el destino se toma del config.json del DLC y se
@@ -123,7 +120,7 @@ Modos de ejecucion:
     configurado o puerto distinto del documentado).
 USO
 }
-while getopts "be:f:i:j:d:p:P:h" _op; do
+while getopts "e:f:i:j:d:p:P:h" _op; do
     case "$_op" in
         e) EP1_FQDN="$OPTARG" ;;
         f) EP2_FQDN="$OPTARG" ;;
@@ -132,7 +129,6 @@ while getopts "be:f:i:j:d:p:P:h" _op; do
         d) EP_MANUAL="$OPTARG" ;;
         p) PUERTO_MANUAL="$OPTARG" ;;
         P) PUERTO_ESPERADO="$OPTARG" ;;
-        b) RESPALDO_CFG="si" ;;
         h) uso; exit 0 ;;
         *) uso; exit 1 ;;
     esac
@@ -1170,8 +1166,7 @@ fi
 # BLOQUE 7 - Respaldo de configuracion (opcional, -b)
 #=============================================================================
 BK_FILE=""
-if [[ -n "$RESPALDO_CFG" ]]; then
-    seccion "BLOQUE 7 - Respaldo de configuracion del DLC (-b)"
+seccion "BLOQUE 7 - Respaldo de configuracion del DLC"
     CFG_BK_SH="$DLC_HOME/current/script/configBackup.sh"
     mkdir -p /store/tmp 2>/dev/null
     if [[ -x "$CFG_BK_SH" ]]; then
@@ -1204,9 +1199,8 @@ if [[ -n "$RESPALDO_CFG" ]]; then
             add_result 51_respaldo FALLA "Respaldo de configuracion" "El archivo $BK_FILE existe pero no lista contenido valido (tar -tzf fallo): NO iniciar la ventana con este respaldo."
         fi
     else
-        add_result 51_respaldo FALLA "Respaldo de configuracion" "La ejecucion del respaldo no reporto un archivo generado, o el archivo reportado no existe o esta vacio (ver evidencias/51_respaldo.txt). NO iniciar la ventana sin un respaldo verificado."
+        add_result 51_respaldo FALLA "Respaldo de configuracion" "La ejecucion del respaldo no reporto un archivo generado, o el archivo reportado no existe o esta vacio (ver evidencias/51_respaldo.txt). NO iniciar una ventana de cambio sin un respaldo verificado."
     fi
-fi
 
 #=============================================================================
 seccion "RESUMEN DE RESULTADOS"
