@@ -81,10 +81,14 @@ PUERTO_ESPERADO="32500"
 # Respaldo de configuracion (bloque 7): vacio = no ejecutar; "si" o flag -b.
 RESPALDO_CFG=""
 
-# Nombres de los artefactos del certificado firmado dentro de keystore/<UUID>/
-# (ajustar si la convencion del despliegue difiere).
-CERT_FIRMADO_NOMBRE="firmado.pem"
-CERT_FULLCHAIN_NOMBRE="dlc-fullchain.pem"
+# Certificado firmado y cadena completa dentro de keystore/<UUID>/: por
+# defecto se AUTODETECTAN por contenido, dado que cada despliegue los nombra
+# de forma arbitraria (firmado.pem, mia-dlc-client.pem, etc.). Criterios:
+# certificado firmado = x509 con CN igual al UUID o con la llave publica del
+# CSR; cadena completa = archivo con multiples BEGIN CERTIFICATE.
+# Definir un nombre aqui SOLO para forzar un archivo concreto.
+CERT_FIRMADO_NOMBRE=""
+CERT_FULLCHAIN_NOMBRE=""
 
 # Puertos de recepción de syslog en el DLC
 PUERTOS_ENTRADA="514 or port 1514 or port 6514"
@@ -724,7 +728,33 @@ else
 fi
 
 # 34 - Certificados --------------------------------------------------------
-CERT_CMDS="ls -l '$KEYSTORE_DIR' '$KEYSTORE_DIR'/*/ 2>/dev/null; echo;
+# Autodeteccion del certificado firmado y la cadena completa (primera
+# instancia UUID del keystore; los nombres de archivo son arbitrarios).
+UUID_DIR=$(find "$KEYSTORE_DIR" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1)
+CERT_F=""; CERT_FC=""
+if [[ -n "$UUID_DIR" ]] && tiene openssl; then
+    U_DET=$(basename "$UUID_DIR"); MC_DET=""
+    [[ -f "$UUID_DIR/dlc-client.csr" ]] && MC_DET=$(openssl req -in "$UUID_DIR/dlc-client.csr" -noout -modulus 2>/dev/null | md5sum | awk '{print $1}')
+    for c in "$UUID_DIR"/*.pem "$UUID_DIR"/*.cer "$UUID_DIR"/*.crt; do
+        [[ -f "$c" ]] || continue
+        n=$(grep -c 'BEGIN CERTIFICATE' "$c" 2>/dev/null)
+        [[ "$n" -ge 1 ]] || continue
+        cn=$(openssl x509 -in "$c" -noout -subject 2>/dev/null | sed -n 's@.*CN *= *\([^,]*\).*@\1@p')
+        mm=$(openssl x509 -in "$c" -noout -modulus 2>/dev/null | md5sum | awk '{print $1}')
+        if [[ "$n" -gt 1 ]]; then
+            [[ -z "$CERT_FC" ]] && CERT_FC="$c"
+        elif [[ "$cn" == "$U_DET" || ( -n "$MC_DET" && "$mm" == "$MC_DET" ) ]]; then
+            [[ -z "$CERT_F" ]] && CERT_F="$c"
+        fi
+    done
+fi
+# Overrides manuales, si se definieron en los parametros
+[[ -n "$CERT_FIRMADO_NOMBRE" && -n "$UUID_DIR" && -f "$UUID_DIR/$CERT_FIRMADO_NOMBRE" ]] && CERT_F="$UUID_DIR/$CERT_FIRMADO_NOMBRE"
+[[ -n "$CERT_FULLCHAIN_NOMBRE" && -n "$UUID_DIR" && -f "$UUID_DIR/$CERT_FULLCHAIN_NOMBRE" ]] && CERT_FC="$UUID_DIR/$CERT_FULLCHAIN_NOMBRE"
+
+CERT_CMDS="echo 'Certificado firmado detectado : ${CERT_F:-NO DETECTADO}';
+echo 'Cadena completa detectada     : ${CERT_FC:-no detectada (opcional)}'; echo;
+ls -l '$KEYSTORE_DIR' '$KEYSTORE_DIR'/*/ 2>/dev/null; echo;
 echo '--- Certificados en keystore (x509):';
 for c in \$(find '$KEYSTORE_DIR' -type f \\( -name '*.cer' -o -name '*.crt' -o -name '*.pem' \\) 2>/dev/null); do
   echo \"== \$c\"; openssl x509 -in \"\$c\" -noout -subject -enddate 2>/dev/null;
@@ -742,7 +772,7 @@ done; echo;
 echo '--- Validacion de CADENA de confianza (certificados que usa el producto):';
 BUNDLE=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem;
 for d in '$KEYSTORE_DIR'/*/; do
-  F=\"\${d}$CERT_FIRMADO_NOMBRE\"; FC=\"\${d}$CERT_FULLCHAIN_NOMBRE\";
+  F=\"$CERT_F\"; FC=\"$CERT_FC\";
   [ -f \"\$F\" ] || continue;
   echo \"== UUID: \$(basename \"\$d\")\";
   UNT='';
@@ -754,7 +784,7 @@ done; echo;
 echo '--- CORRESPONDENCIA certificado firmado <-> PFX en uso <-> llave privada:';
 FP1='';
 for d in '$KEYSTORE_DIR'/*/; do
-  F=\"\${d}$CERT_FIRMADO_NOMBRE\"; [ -f \"\$F\" ] || continue;
+  F=\"$CERT_F\"; [ -f \"\$F\" ] || continue;
   FP1=\$(openssl x509 -in \"\$F\" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2);
   echo \"huella cert firmado (\$(basename \"\$d\")): \$FP1\";
 done;
@@ -785,7 +815,7 @@ fi; echo;
 echo '--- DEDUCCION de la cadena: emisor del certificado del DLC vs CAs instaladas:';
 echo '(no hace falta conocer el raiz/intermedio de antemano: se identifican por hash de emisor)';
 for d in '$KEYSTORE_DIR'/*/; do
-  F=\"\${d}$CERT_FIRMADO_NOMBRE\"; [ -f \"\$F\" ] || continue;
+  F=\"$CERT_F\"; [ -f \"\$F\" ] || continue;
   echo \"cliente    : \$(openssl x509 -in \"\$F\" -noout -subject 2>/dev/null)\";
   echo \"emisor     : \$(openssl x509 -in \"\$F\" -noout -issuer 2>/dev/null)\";
   IH=\$(openssl x509 -in \"\$F\" -noout -issuer_hash 2>/dev/null);
@@ -817,7 +847,7 @@ echo '--- CAs de cliente ACEPTADAS por el EP (expuestas en el handshake TLS mutu
 if [ -n '$TLS_DEST' ]; then
   LISTA=\$(echo | timeout 20 openssl s_client -connect '$TLS_DEST:$DEST_PORT' 2>/dev/null | sed -n '/Acceptable client certificate CA names/,/^---/p' | head -25);
   if [ -n \"\$LISTA\" ]; then echo \"\$LISTA\"; else echo 'el EP no expone lista de CAs aceptadas o no se pudo consultar'; fi;
-  FPEM=\$(find '$KEYSTORE_DIR' -maxdepth 2 -name '$CERT_FIRMADO_NOMBRE' 2>/dev/null | head -1);
+  FPEM=\"$CERT_F\";
   if [ -n \"\$FPEM\" ] && [ -n \"\$LISTA\" ]; then
     CNV=\$(openssl x509 -in \"\$FPEM\" -noout -issuer 2>/dev/null | sed -n 's/.*CN *= *\([^,]*\).*/\1/p');
     if [ -n \"\$CNV\" ] && printf '%s' \"\$LISTA\" | grep -qF \"\$CNV\"; then
@@ -845,7 +875,7 @@ done;
 [ -z \"\$HAY_ANCLA\" ] && echo '  PROCEDIMIENTO DESVIACION: no existen anclas en /etc/pki/ca-trust/source/anchors (paso 2 del procedimiento no ejecutado)';
 echo 'paso 2: CSR generado con generateCertificate.sh -csr (keystore/<UUID>/dlc-client.csr)';
 for d in '$KEYSTORE_DIR'/*/; do
-  U=\$(basename \"\$d\"); CSR=\"\${d}dlc-client.csr\"; F=\"\${d}$CERT_FIRMADO_NOMBRE\";
+  U=\$(basename \"\$d\"); CSR=\"\${d}dlc-client.csr\"; F=\"$CERT_F\";
   if [ -f \"\$CSR\" ]; then
     CNC=\$(openssl req -in \"\$CSR\" -noout -subject 2>/dev/null | sed -n 's@.*CN *= *\([^,]*\).*@\1@p');
     echo \"  PROCEDIMIENTO OK: CSR presente (UUID \$U; CN=\${CNC:-no legible})\";
@@ -869,7 +899,7 @@ for d in '$KEYSTORE_DIR'/*/; do
       echo \"  PROCEDIMIENTO DESVIACION: CN del certificado firmado (\${CNF:-vacio}) distinto del UUID (\$U)\";
     fi;
   elif [ ! -f \"\$F\" ]; then
-    echo \"  PROCEDIMIENTO DESVIACION: no existe el certificado firmado ($CERT_FIRMADO_NOMBRE) en \$d\";
+    echo \"  PROCEDIMIENTO DESVIACION: no se detecto el certificado firmado en \$d (se busca un x509 con CN igual al UUID o con la llave publica del CSR)\";
   fi;
 done;
 echo 'paso 4: PFX generado con generateCertificate.sh -p12 (keystore/dlc-client.pfx)';
