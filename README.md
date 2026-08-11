@@ -44,6 +44,7 @@ sudo ./dlc_diagnostico_so.sh \
 | `-d <destino>` | IP o FQDN destino manual (prioridad sobre config.json) |
 | `-p <puerto>` | Puerto destino manual (prioridad sobre config.json) |
 | `-P <puerto>` | Puerto esperado para la comparación (por defecto 32500; en QRoC no debe cambiarse) |
+| `-b` | Ejecuta además el respaldo de configuración del DLC (usa el `configBackup.sh` oficial, o un equivalente con las mismas rutas), verifica el contenido con `tar -tzf` y normaliza el nombre a formato portable |
 | `-h` | Ayuda |
 
 ## Pruebas incluidas
@@ -57,6 +58,18 @@ sudo ./dlc_diagnostico_so.sh \
 | 4 — Frontera DLC | config.json, **coherencia esperado-configurado-resuelto**, tráfico entrante/saliente (tcpdump), contadores JMX en dos muestras, **certificados: vigencia, cadena (raíz/intermedio deducidos por hash de emisor), correspondencia con el PFX en uso, CAs aceptadas por el EP y cumplimiento del procedimiento de instalación (pasos 1–5)**, log de errores con antigüedad, **CRLs cacheadas y capacidad de refresco HTTP/80**, validación JSON de la configuración (con clasificación de archivos de fábrica en formato tolerante) |
 | 5 — Post-parcheo | Historial dnf con versiones antes/después, kernel corriendo vs instalado, crypto-policies de RHEL 9, paquetes sensibles modificados (60 días) |
 | 6 — Soporte | Paquete oficial para IBM Support (TechNote 7274013) |
+
+## Uso en ventanas de actualización del servidor
+
+**Antes de la ventana** — una sola ejecución genera la línea base y el respaldo verificado:
+
+```bash
+sudo ./dlc_diagnostico_so.sh -b
+```
+
+Conservar el `.tgz` del diagnóstico (línea base) y **copiar el respaldo de configuración fuera del servidor** (reside en `/store/tmp/` del propio host). Complementar con snapshot de la VM, y verificar `systemctl is-enabled dlc` y `/store` en `/etc/fstab`.
+
+**Después de la ventana** (y del reinicio si aplicó kernel): ejecutar de nuevo el script y comparar contra la línea base — el bloque 5 documenta las versiones antes/después de cada paquete y señala si el parcheo tocó componentes sensibles (Java, openssl, crypto-policies, firewalld, SELinux, kernel). Cerrar validando en la consola de QRoC que eventos y health metrics continúan llegando.
 
 ## Resultado
 

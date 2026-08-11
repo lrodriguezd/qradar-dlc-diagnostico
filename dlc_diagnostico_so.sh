@@ -21,7 +21,14 @@
 #   elimina al terminar para no ocupar espacio.
 #
 # Uso:   sudo ./dlc_diagnostico_so.sh [-e fqdn_ep1] [-f fqdn_ep2] [-i ip_ep1]
-#          [-j ip_ep2] [-d destino] [-p puerto] [-P puerto_esperado] [-h]
+#          [-j ip_ep2] [-d destino] [-p puerto] [-P puerto_esperado] [-b] [-h]
+#
+#   -b agrega el RESPALDO DE CONFIGURACION del DLC (configBackup.sh oficial,
+#      o un equivalente con las mismas rutas si no existe), con verificacion
+#      de contenido y nombre de archivo portable. Pensado para ejecutar una
+#      sola corrida antes de una ventana de actualizacion: diagnostico
+#      (linea base) + respaldo verificado. Unica escritura adicional: el
+#      archivo de respaldo en /store/tmp.
 #
 # MODOS DE EJECUCION:
 #   1) Autonomo (sin opciones): el script lee el destino real del config.json
@@ -71,6 +78,9 @@ PUERTO_MANUAL=""   # puerto a probar
 # En QRadar on Cloud debe permanecer en 32500 (no debe cambiarse).
 PUERTO_ESPERADO="32500"
 
+# Respaldo de configuracion (bloque 7): vacio = no ejecutar; "si" o flag -b.
+RESPALDO_CFG=""
+
 # Nombres de los artefactos del certificado firmado dentro de keystore/<UUID>/
 # (ajustar si la convencion del despliegue difiere).
 CERT_FIRMADO_NOMBRE="firmado.pem"
@@ -95,6 +105,9 @@ Uso: sudo ./dlc_diagnostico_so.sh [opciones]   (ejecutar como root en el DLC)
   -d <destino> IP o FQDN destino manual (prioridad sobre config.json)
   -p <puerto>  Puerto destino manual (prioridad sobre config.json)
   -P <puerto>  Puerto esperado para la comparacion (por defecto 32500)
+  -b           Ejecuta ademas el respaldo de configuracion del DLC
+               (configBackup.sh oficial o equivalente), con verificacion.
+               Recomendado antes de una ventana de actualizacion.
   -h           Muestra esta ayuda
 
 Modos de ejecucion:
@@ -106,7 +119,7 @@ Modos de ejecucion:
     configurado o puerto distinto del documentado).
 USO
 }
-while getopts "e:f:i:j:d:p:P:h" _op; do
+while getopts "be:f:i:j:d:p:P:h" _op; do
     case "$_op" in
         e) EP1_FQDN="$OPTARG" ;;
         f) EP2_FQDN="$OPTARG" ;;
@@ -115,6 +128,7 @@ while getopts "e:f:i:j:d:p:P:h" _op; do
         d) EP_MANUAL="$OPTARG" ;;
         p) PUERTO_MANUAL="$OPTARG" ;;
         P) PUERTO_ESPERADO="$OPTARG" ;;
+        b) RESPALDO_CFG="si" ;;
         h) uso; exit 0 ;;
         *) uso; exit 1 ;;
     esac
@@ -1123,6 +1137,41 @@ else
 fi
 
 #=============================================================================
+# BLOQUE 7 - Respaldo de configuracion (opcional, -b)
+#=============================================================================
+BK_FILE=""
+if [[ -n "$RESPALDO_CFG" ]]; then
+    seccion "BLOQUE 7 - Respaldo de configuracion del DLC (-b)"
+    CFG_BK_SH="$DLC_HOME/current/script/configBackup.sh"
+    mkdir -p /store/tmp 2>/dev/null
+    if [[ -x "$CFG_BK_SH" ]]; then
+        cap 51_respaldo "Respaldo de configuracion (configBackup.sh oficial de IBM)" \
+            "'$CFG_BK_SH' 2>&1 | tail -5"
+    else
+        cap 51_respaldo "Respaldo de configuracion (equivalente: mismas rutas del configBackup.sh oficial)" \
+            "BK=/store/tmp/dlc_config_backup_\$(date +%Y-%m-%dT%H-%M-%S).tar.gz;
+             tar -czf \"\$BK\" '$DLC_HOME/MKS' '$DLC_HOME/keystore' '$DLC_HOME/trusted_certificates' '$DLC_HOME/conf' /store/ec /etc/dlc/instance /etc/pki/ca-trust/source/anchors '$DLC_HOME/current/eventgnosis/config/' /etc/firewalld/zones /etc/firewalld/services/ 2>&1 | tail -3;
+             echo \"Configuration has been backed up to file \$BK\""
+    fi
+    BK_FILE=$(find /store/tmp -maxdepth 1 -name 'dlc_config_backup_*' -type f -mmin -15 2>/dev/null | sort | tail -1)
+    if [[ -n "$BK_FILE" && -s "$BK_FILE" ]]; then
+        # Mejora: nombre portable (los dos puntos son invalidos en Windows)
+        BK_SAFE="${BK_FILE//:/-}"
+        if [[ "$BK_SAFE" != "$BK_FILE" ]]; then
+            mv "$BK_FILE" "$BK_SAFE" && BK_FILE="$BK_SAFE"
+        fi
+        BK_N=$(tar -tzf "$BK_FILE" 2>/dev/null | wc -l | tr -d ' ')
+        if [[ "$BK_N" -gt 0 ]]; then
+            add_result 51_respaldo OK "Respaldo de configuracion" "$BK_FILE ($(du -h "$BK_FILE" 2>/dev/null | awk '{print $1}'), $BK_N entradas verificadas con tar -tzf; incluye conf, keystore, MKS, anclas CA y firewalld). IMPORTANTE: el respaldo reside en este mismo servidor; copiarlo FUERA antes de iniciar la ventana de cambio."
+        else
+            add_result 51_respaldo FALLA "Respaldo de configuracion" "El archivo $BK_FILE existe pero no lista contenido valido (tar -tzf fallo): NO iniciar la ventana con este respaldo."
+        fi
+    else
+        add_result 51_respaldo FALLA "Respaldo de configuracion" "No se genero el archivo de respaldo en /store/tmp (ver evidencias/51_respaldo.txt). NO iniciar la ventana sin respaldo verificado."
+    fi
+fi
+
+#=============================================================================
 seccion "RESUMEN DE RESULTADOS"
 #=============================================================================
 {
@@ -1312,6 +1361,7 @@ echo "============================================================"
 echo " Diagnostico terminado."
 echo " PAQUETE FINAL : $RES_PAQ"
 echo " Limpieza      : $LIMPIEZA"
+[[ -n "$BK_FILE" ]] && echo " Respaldo cfg  : $BK_FILE  (copiarlo FUERA del servidor)"
 echo " Para revisar  : tar -xzf $PAQUETE"
 echo "   Contiene: informe.txt, informe.html, evidencias/ (un .txt"
 echo "   por prueba) y soporte_ibm/dlc.tar.gz (TechNote 7274013)."
