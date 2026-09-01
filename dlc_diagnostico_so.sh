@@ -21,7 +21,7 @@
 #   elimina al terminar para no ocupar espacio.
 #
 # Uso:   sudo ./dlc_diagnostico_so.sh [-e fqdn_ep1] [-f fqdn_ep2] [-i ip_ep1]
-#          [-j ip_ep2] [-d destino] [-p puerto] [-P puerto_esperado] [-h]
+#          [-j ip_ep2] [-d destino] [-p puerto] [-P puerto_esperado] [-h] [-V]
 #
 # Cada ejecucion incluye el RESPALDO DE CONFIGURACION del DLC (bloque 7,
 # prueba 51): usa el configBackup.sh oficial de IBM o un equivalente con las
@@ -50,6 +50,12 @@
 
 set -u
 export LANG=C LC_ALL=C
+
+# Version del script. Queda impresa en el informe y en el HTML: los veredictos
+# cambian entre versiones (por ejemplo, 42_crypto pasó a distinguir las
+# subpoliticas criptograficas), de modo que un informe debe poder atribuirse a
+# la version exacta que lo produjo.
+VERSION="1.1"
 
 #--------------------------- PARÁMETROS EDITABLES ----------------------------
 DLC_HOME="/opt/ibm/si/services/dlc"
@@ -93,6 +99,17 @@ PUERTOS_ENTRADA="514 or port 1514 or port 6514"
 TCPDUMP_SEGUNDOS=20      # duración máxima de cada captura
 JMX_INTERVALO=30         # segundos entre las dos muestras de contadores JMX
 DISCO_UMBRAL=90          # % de uso de disco que se considera FALLA
+
+# Buffer de eventos en disco: el DLC acumula aqui lo que no logra entregar a
+# QRoC. La prueba 38 lo mide dos veces para determinar si crece, se drena o
+# esta estancado.
+BUFFER_DIR="/store/ec"
+BUFFER_VENTANA_MIN=30    # ventana minima de observacion del buffer (segundos)
+
+# Umbrales de descriptores de archivo del proceso DLC (prueba 14), en % del
+# limite soft: al agotarlos el DLC deja de aceptar conexiones sin detenerse.
+FD_UMBRAL_FALLA=90
+FD_UMBRAL_ALERTA=75
 #-----------------------------------------------------------------------------
 
 #--------------------- PARAMETROS DE LINEA DE COMANDOS -----------------------
@@ -107,6 +124,7 @@ Uso: sudo ./dlc_diagnostico_so.sh [opciones]   (ejecutar como root en el DLC)
   -p <puerto>  Puerto destino manual (prioridad sobre config.json)
   -P <puerto>  Puerto esperado para la comparacion (por defecto 32500)
   -h           Muestra esta ayuda
+  -V           Muestra la version del script
 
 Cada ejecucion incluye el respaldo de configuracion del DLC (prueba 51),
 verificado e integrado al paquete final.
@@ -120,7 +138,7 @@ Modos de ejecucion:
     configurado o puerto distinto del documentado).
 USO
 }
-while getopts "e:f:i:j:d:p:P:h" _op; do
+while getopts "e:f:i:j:d:p:P:hV" _op; do
     case "$_op" in
         e) EP1_FQDN="$OPTARG" ;;
         f) EP2_FQDN="$OPTARG" ;;
@@ -130,6 +148,7 @@ while getopts "e:f:i:j:d:p:P:h" _op; do
         p) PUERTO_MANUAL="$OPTARG" ;;
         P) PUERTO_ESPERADO="$OPTARG" ;;
         h) uso; exit 0 ;;
+        V) echo "dlc_diagnostico_so.sh v$VERSION"; exit 0 ;;
         *) uso; exit 1 ;;
     esac
 done
@@ -167,12 +186,30 @@ seccion() {
     nota "============================================================"
 }
 
+# Sustitucion LITERAL del password del keystore por un marcador. Se usa awk
+# con index() y no una expansion de shell: en ${var//$pat/...} el patron se
+# interpreta como glob, de modo que un password con ?, [ o \ NO se enmascara
+# y queda en claro en la evidencia (y por tanto en el .tgz que se adjunta al
+# caso de IBM). Se omiten passwords de menos de 4 caracteres para no mutilar
+# la salida con coincidencias fortuitas.
+ocultar_pass() {  # ocultar_pass <archivo>
+    [[ -n "${KS_PASS:-}" && ${#KS_PASS} -ge 4 && -f "$1" ]] || return 0
+    if awk -v p="$KS_PASS" -v r='***OCULTO***' '
+        { while ((i = index($0, p)) > 0) $0 = substr($0, 1, i-1) r substr($0, i + length(p)); print }
+    ' "$1" > "$1.tmp" 2>/dev/null; then
+        mv -f "$1.tmp" "$1" 2>/dev/null || rm -f "$1.tmp"
+    else
+        rm -f "$1.tmp"
+    fi
+}
+
 cap() {  # cap <id> <descripcion> <comando...>  -> guarda evidencia + informe
     local id="$1" desc="$2"; shift 2
     local f="$EVID/$id.txt"
     local cmd_mostrado="$*"
-    # Nunca imprimir el password del keystore en la evidencia
-    [[ -n "${KS_PASS:-}" ]] && cmd_mostrado="${cmd_mostrado//$KS_PASS/***OCULTO***}"
+    # Nunca imprimir el password del keystore en la evidencia. Las comillas
+    # alrededor del patron lo vuelven literal (sin ellas seria un glob).
+    [[ -n "${KS_PASS:-}" ]] && cmd_mostrado="${cmd_mostrado//"$KS_PASS"/***OCULTO***}"
     {
         echo "# $desc"
         echo "# Comando: $cmd_mostrado"
@@ -182,6 +219,9 @@ cap() {  # cap <id> <descripcion> <comando...>  -> guarda evidencia + informe
     timeout 90 bash -c "$*" >> "$f" 2>&1
     local rc=$?
     echo "#---- (codigo de salida: $rc; 0 = el comando termino bien, otro valor = fallo o no existe)" >> "$f"
+    # Segunda barrera: el password tambien puede aparecer en la SALIDA del
+    # comando (un volcado de configuracion, una traza de error de openssl).
+    ocultar_pass "$f"
     nota ""
     cat "$f" >> "$INFORME"
     return $rc
@@ -195,6 +235,13 @@ salida() {  # salida <id> : imprime unicamente la salida real de la evidencia,
     awk '/^#----------------------------------------$/{f=1;next} f' "$EVID/$1.txt" 2>/dev/null
 }
 
+muestra_buffer() {  # imprime "<bytes> <archivos>" del buffer de eventos en disco
+    local b f
+    b=$(timeout 30 du -sb "$BUFFER_DIR" 2>/dev/null | awk '{print $1; exit}')
+    f=$(timeout 30 find "$BUFFER_DIR" -type f 2>/dev/null | wc -l)
+    echo "${b:-0} ${f:-0}"
+}
+
 no_ejecutada() {  # no_ejecutada <id> <descripcion> <motivo>
     # Regla definida: una prueba que no pudo ejecutarse se registra como FALLA,
     # dado que deja el diagnostico incompleto y ello constituye un hallazgo.
@@ -204,7 +251,7 @@ no_ejecutada() {  # no_ejecutada <id> <descripcion> <motivo>
 #------------------------------- ENCABEZADO ---------------------------------
 # UUID de la instancia DLC: nombre del subdirectorio del keystore; es el CN
 # del certificado de cliente y el identificador de la instancia en QRadar.
-DLC_UUID=$(find "$KEYSTORE_DIR" -maxdepth 1 -mindepth 1 -type d 2>/dev/null -exec basename {} \; | tr '\n' ' ')
+DLC_UUID=$(find "$KEYSTORE_DIR" -maxdepth 1 -mindepth 1 -type d -exec basename {} \; 2>/dev/null | tr '\n' ' ')
 DLC_UUID="${DLC_UUID%% }"
 {
     echo "############################################################"
@@ -216,7 +263,7 @@ DLC_UUID="${DLC_UUID%% }"
     echo "# Version DLC (symlink current):"
     ls -ld "$DLC_HOME/current" 2>/dev/null | sed 's/^/#   /'
     echo "# UUID DLC  : ${DLC_UUID:-no identificado}"
-    echo "# Script    : dlc_diagnostico_so.sh (solo lectura)"
+    echo "# Script    : dlc_diagnostico_so.sh v$VERSION (solo lectura)"
     echo "# AVISO     : Este script NO cuenta con soporte oficial de IBM."
     echo "#             Herramienta de diagnostico de campo elaborada por"
     echo "#             lrodriguezd@outlook.com."
@@ -258,8 +305,8 @@ seccion "BLOQUE 0 - Verificacion de prerequisitos"
 #=============================================================================
 # Comandos requeridos por las pruebas. Si falta alguno: FALLA aqui, y la
 # prueba dependiente tambien se marca FALLA como "no ejecutada".
-REQ_CMDS="systemctl journalctl ss ip getent firewall-cmd tcpdump openssl curl findmnt rpm dnf tar gzip awk sed grep df free timeout dd traceroute"
-OPC_CMDS="jq ausearch chronyc netstat alternatives dig tcptraceroute"
+REQ_CMDS="systemctl journalctl ss ip getent firewall-cmd tcpdump openssl curl findmnt rpm dnf tar gzip awk sed grep df du find free timeout dd traceroute"
+OPC_CMDS="jq ausearch chronyc netstat alternatives dig tcptraceroute numfmt"
 cap 00_prereq "Inventario de comandos requeridos y opcionales" \
     "echo '--- requeridos:';
      for c in $REQ_CMDS; do printf '%-14s: ' \"\$c\"; command -v \"\$c\" 2>/dev/null || echo 'NO INSTALADO'; done;
@@ -433,7 +480,14 @@ cap 12_java "Java en uso por el DLC (el parche pudo reemplazarlo)" \
      echo; echo '--- java en PATH:'; command -v java && java -version 2>&1;
      echo; echo '--- alternatives:'; alternatives --display java 2>/dev/null | head -15;
      echo; echo '--- RPMs java instalados:'; rpm -qa | grep -iE 'ibm-java|java-|openjdk' | sort"
-JAVA_INFO=$( { [[ -n "$JAVA_CMD" ]] && "$JAVA_CMD" -version 2>&1 || java -version 2>&1; } | head -3 | tr '\n' ' ' )
+# Con 'A && B || C' un java del DLC que existe pero falla al ejecutarse hace
+# caer la evaluacion en el java del PATH y CONCATENA ambas salidas: el
+# veredicto terminaria describiendo un runtime distinto del que corre el DLC.
+if [[ -n "$JAVA_CMD" ]]; then
+    JAVA_INFO=$("$JAVA_CMD" -version 2>&1 | head -3 | tr '\n' ' ')
+else
+    JAVA_INFO=$(java -version 2>&1 | head -3 | tr '\n' ' ')
+fi
 if echo "$JAVA_INFO" | grep -qiE 'ibm|j9'; then
     add_result 12_java OK "Java de IBM presente" "$JAVA_INFO"
 elif echo "$JAVA_INFO" | grep -q '1.8'; then
@@ -449,6 +503,50 @@ if salida 13_escucha | grep -q ':1514'; then
     add_result 13_escucha OK "Puerto 1514 en escucha" "$(salida 13_escucha | grep ':1514' | head -1 | tr -s ' ')"
 else
     add_result 13_escucha FALLA "Puerto 1514 en escucha" "El DLC no esta escuchando en 1514: el servicio no inicio sus listeners."
+fi
+
+# 14 - Descriptores de archivo del proceso DLC -----------------------------
+# Un colector de syslog consume un descriptor por conexion entrante, por
+# archivo del buffer y por socket saliente. Al agotar el limite 'nofile' el
+# proceso NO muere: deja de aceptar conexiones y de abrir archivos, de modo
+# que el servicio se sigue viendo activo mientras ya no recibe ni entrega.
+# El limite que aplica es el de la unidad systemd (LimitNOFILE), no el de
+# /etc/security/limits.conf, que systemd ignora para los servicios.
+if [[ "$DLC_PID" -gt 0 && -r "/proc/$DLC_PID/limits" ]]; then
+    FD_USADOS=$(find "/proc/$DLC_PID/fd" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
+    FD_SOFT=$(awk '/Max open files/ {print $4; exit}' "/proc/$DLC_PID/limits" 2>/dev/null)
+    FD_HARD=$(awk '/Max open files/ {print $5; exit}' "/proc/$DLC_PID/limits" 2>/dev/null)
+    cap 14_limites "Descriptores de archivo del proceso DLC y limites vigentes" \
+        "echo 'PID del DLC: $DLC_PID';
+         echo 'Descriptores abiertos: ${FD_USADOS} (limite soft: ${FD_SOFT:-?}, hard: ${FD_HARD:-?})';
+         echo; echo '--- limites del proceso (/proc/$DLC_PID/limits):';
+         grep -E 'Limit|Max open files|Max processes|Max locked memory' /proc/$DLC_PID/limits;
+         echo; echo '--- limites declarados en la unidad systemd (son los que aplican al servicio):';
+         systemctl show dlc -p LimitNOFILE -p LimitNOFILESoft -p LimitNPROC 2>/dev/null;
+         echo; echo '--- limite global del sistema (fs.file-nr: en_uso  sin_usar  maximo):';
+         cat /proc/sys/fs/file-nr 2>/dev/null;
+         echo; echo '--- desglose de los descriptores abiertos por tipo:';
+         printf 'sockets (conexiones y escuchas): %s\n' \"\$(find /proc/$DLC_PID/fd -lname 'socket:*' 2>/dev/null | wc -l)\";
+         printf 'pipes                          : %s\n' \"\$(find /proc/$DLC_PID/fd -lname 'pipe:*'   2>/dev/null | wc -l)\";
+         printf 'archivos y dispositivos        : %s\n' \"\$(find /proc/$DLC_PID/fd -lname '/*'       2>/dev/null | wc -l)\""
+    if [[ "${FD_SOFT:-}" =~ ^[0-9]+$ && "$FD_SOFT" -gt 0 ]]; then
+        FD_PCT=$(( FD_USADOS * 100 / FD_SOFT ))
+        if [[ "$FD_PCT" -ge "$FD_UMBRAL_FALLA" ]]; then
+            add_result 14_limites FALLA "Descriptores de archivo del DLC" "El proceso usa $FD_USADOS de $FD_SOFT descriptores permitidos (${FD_PCT}%). Al agotarlos el DLC deja de aceptar conexiones de los log sources y de abrir archivos del buffer SIN que el servicio se detenga: aparenta estar activo mientras ya no recibe ni entrega. Elevar LimitNOFILE en la unidad systemd del servicio y reiniciar en ventana."
+        elif [[ "$FD_PCT" -ge "$FD_UMBRAL_ALERTA" ]]; then
+            add_result 14_limites ALERTA "Descriptores de archivo del DLC" "El proceso usa $FD_USADOS de $FD_SOFT descriptores permitidos (${FD_PCT}%): el margen es reducido. Correlacionar con el numero de log sources configurados y vigilar la tendencia antes de agregar mas fuentes."
+        else
+            add_result 14_limites OK "Descriptores de archivo del DLC" "El proceso usa $FD_USADOS de $FD_SOFT descriptores permitidos (${FD_PCT}%); margen suficiente."
+        fi
+    elif [[ "${FD_SOFT:-}" == "unlimited" ]]; then
+        add_result 14_limites OK "Descriptores de archivo del DLC" "Sin limite de descriptores (unlimited); el proceso mantiene $FD_USADOS abiertos."
+    else
+        no_ejecutada 14_limites "Descriptores de archivo del DLC" "no se pudo leer el limite 'Max open files' en /proc/$DLC_PID/limits"
+    fi
+elif [[ "$DLC_PID" -gt 0 ]]; then
+    no_ejecutada 14_limites "Descriptores de archivo del DLC" "no se puede leer /proc/$DLC_PID/limits"
+else
+    no_ejecutada 14_limites "Descriptores de archivo del DLC" "el servicio dlc esta detenido: no hay proceso al cual medirle los descriptores (ver 10_servicio)"
 fi
 
 #=============================================================================
@@ -622,9 +720,67 @@ else
     no_ejecutada 27_traceroute "Ruta TCP al EP" "no se pudo determinar el destino QRoC"
 fi
 
+# 28 - Proxy del entorno ---------------------------------------------------
+# Las pruebas 26 (IP publica de salida) y 36 (refresco de CRL por HTTP/80)
+# se apoyan en curl, que honra http_proxy/https_proxy del entorno. El DLC es
+# un proceso Java y solo usa proxy si recibe -Dhttp.proxyHost/-Dhttps.proxyHost.
+# Cuando ambos difieren, curl puede salir por el proxy y responder bien
+# mientras el DLC sale directo y lo detiene el perimetro (o al reves): sin
+# este dato, los resultados de 26 y 36 se interpretan como si describieran la
+# salida del DLC cuando en realidad describen la de curl.
+JAVA_CMDLINE=""
+PROXY_PROC=""
+if [[ "$DLC_PID" -gt 0 ]]; then
+    [[ -r "/proc/$DLC_PID/cmdline" ]] && JAVA_CMDLINE=$(tr '\0' ' ' < "/proc/$DLC_PID/cmdline" 2>/dev/null)
+    [[ -r "/proc/$DLC_PID/environ" ]] && PROXY_PROC=$(tr '\0' '\n' < "/proc/$DLC_PID/environ" 2>/dev/null | grep -iE '^(http|https|all|no)_proxy=' | cut -d= -f1 | tr '\n' ' ')
+fi
+# Entorno del propio script: es el que usa curl en las pruebas 26 y 36, de
+# modo que determina lo que esas pruebas miden realmente.
+PROXY_SHELL=$(env 2>/dev/null | grep -iE '^(http|https|all)_proxy=' | cut -d= -f1 | tr '\n' ' ')
+PROXY_SIS=$(grep -rhiE '^[[:space:]]*(export[[:space:]]+)?(http|https|all)_proxy=' /etc/environment /etc/profile.d/ /etc/sysconfig/ /root/.bash_profile /root/.bashrc 2>/dev/null | head -5 | sed 's/=.*/=<valor>/' | tr '\n' ' ')
+PROXY_UNIT=$(systemctl show dlc -p Environment --value 2>/dev/null | tr ' ' '\n' | grep -iE '^(http|https|all|no)_proxy=' | cut -d= -f1 | tr '\n' ' ')
+# La JVM NO honra http_proxy/https_proxy del entorno: solo usa proxy si
+# recibe las propiedades -Dhttp.proxyHost/-Dhttps.proxyHost. Por eso el
+# indicador valido para el DLC es la linea de comando, no sus variables.
+PROXY_JAVA=""
+printf '%s' "$JAVA_CMDLINE" | grep -qiE '\-D(http|https)\.proxyHost' && PROXY_JAVA="si"
+cap 28_proxy "Proxy del entorno: quien lo usa (curl) y quien no (la JVM del DLC)" \
+    "echo '--- proxy en el entorno de ESTE script (es el que usa curl en las pruebas 26 y 36):';
+     echo '${PROXY_SHELL:-ninguna variable de proxy definida}';
+     echo; echo '--- proxy definido en los archivos del sistema:';
+     echo '${PROXY_SIS:-ninguno en /etc/environment, /etc/profile.d, /etc/sysconfig ni el perfil de root}';
+     echo; echo '--- proxy en la unidad systemd del DLC:';
+     echo '${PROXY_UNIT:-ninguno declarado en la unidad}';
+     echo; echo '--- variables de proxy en el entorno del proceso DLC en ejecucion:';
+     echo '${PROXY_PROC:-ninguna (o el servicio esta detenido)}';
+     echo '  (informativas: la JVM ignora http_proxy/https_proxy del entorno)';
+     echo; echo '--- propiedades de proxy en la linea de comando de la JVM del DLC:';
+     echo '${PROXY_JAVA:+-Dhttp.proxyHost / -Dhttps.proxyHost PRESENTES: el DLC sale por proxy}${PROXY_JAVA:-ausentes: el DLC sale de forma DIRECTA}';
+     echo; echo '--- proxy declarado en la configuracion del DLC:';
+     grep -iE 'proxy' '$CONFIG_JSON' 2>/dev/null || echo 'sin claves de proxy en config.json'"
+if [[ -z "$PROXY_SHELL" && -z "$PROXY_JAVA" ]]; then
+    add_result 28_proxy OK "Proxy del entorno" "Ni curl ni la JVM del DLC usan proxy: ambos salen por la misma ruta directa, de modo que los resultados de 26_ip_publica y 36_crl si representan lo que ve el DLC."
+elif [[ -n "$PROXY_SHELL" && -z "$PROXY_JAVA" ]]; then
+    add_result 28_proxy ALERTA "Proxy del entorno" "El entorno de ejecucion define proxy ($PROXY_SHELL) pero la JVM del DLC NO recibe -Dhttp.proxyHost/-Dhttps.proxyHost: curl atraviesa el proxy y el DLC sale de forma directa. En consecuencia, 26_ip_publica y 36_crl describen la salida de curl, no la del DLC: si esas pruebas resultaron correctas, NO permiten descartar un bloqueo perimetral sobre el trafico del DLC. Confirmar con el area de red cual de las dos rutas esta autorizada hacia QRoC."
+elif [[ -z "$PROXY_SHELL" && -n "$PROXY_JAVA" ]]; then
+    add_result 28_proxy ALERTA "Proxy del entorno" "La JVM del DLC sale por proxy (-Dhttp/https.proxyHost) pero el entorno de ejecucion NO define proxy: curl sale directo. Los resultados de 26_ip_publica y 36_crl describen una ruta distinta de la del DLC; en particular, la IP que debe figurar en el allowlist de QRoC es la del proxy, no la reportada por 26."
+else
+    add_result 28_proxy INFO "Proxy del entorno" "Tanto curl como la JVM del DLC salen por proxy. Verificar con el area de red que el proxy permita CONNECT hacia el EP en el puerto $DEST_PORT y salida HTTP/80 hacia los puntos de distribucion de CRL del emisor (ver 36_crl): un proxy que solo publica 443 rompe ambos caminos."
+fi
+
 #=============================================================================
 seccion "BLOQUE 4 - Frontera SO <-> aplicacion DLC (deslinde)"
 #=============================================================================
+
+# Primera muestra del buffer de eventos en disco (prueba 38). Se toma al
+# entrar al bloque para que la ventana de observacion sea el tiempo real que
+# consumen las pruebas 31-37 (capturas tcpdump y muestreo JMX incluidos) y no
+# cueste una espera adicional al final.
+EVBUF_T1=0; EVBUF_B1=0; EVBUF_F1=0
+if [[ -d "$BUFFER_DIR" ]]; then
+    read -r EVBUF_B1 EVBUF_F1 <<<"$(muestra_buffer)"
+    EVBUF_T1=$(date +%s)
+fi
 
 # 30 - Configuracion del DLC ----------------------------------------------
 cap 30_config "Configuracion del DLC (config.json, sin passwords)" \
@@ -959,17 +1115,26 @@ fi
 # 35 - Log de errores del DLC ----------------------------------------------
 cap 35_dlc_error "Log de errores del DLC ($DLC_ERROR_LOG)" \
     "ls -l --time-style=long-iso '$DLC_ERROR_LOG' 2>/dev/null; echo; tail -n 60 '$DLC_ERROR_LOG' 2>/dev/null || echo 'No existe o no legible'"
+# La antiguedad solo tiene sentido si el archivo existe: con stat fallido
+# LOG_MOD queda en 0 y el calculo arroja la edad de la epoca Unix (~20000
+# dias), un dato absurdo dentro de un informe que se entrega al cliente.
 LOG_MOD=$(stat -c %Y "$DLC_ERROR_LOG" 2>/dev/null || echo 0)
-LOG_DIAS=$(( ($(date +%s) - LOG_MOD) / 86400 ))
+if [[ "$LOG_MOD" -gt 0 ]]; then
+    LOG_DIAS=$(( ($(date +%s) - LOG_MOD) / 86400 ))
+    LOG_EDAD="hace $LOG_DIAS dia(s)"
+else
+    LOG_DIAS=-1
+    LOG_EDAD="antiguedad no determinable: $DLC_ERROR_LOG no existe o no es accesible (ver 00_dlclog)"
+fi
 if salida 35_dlc_error | grep -qiE 'ERROR_COULD_NOT_CONNECT|Network is unreachable|Connection refused|handshake|certificate|Crl expired|CRLExpired'; then
     PATRONES=$(salida 35_dlc_error | grep -oiE 'ERROR_COULD_NOT_CONNECT|Network is unreachable|Connection refused|handshake_failure|Q1CRLExpiredException|Crl expired|certificate[a-z_ ]*' | sort -u | head -4 | tr '\n' '; ')
-    if [[ "$LOG_MOD" -gt 0 && "$LOG_DIAS" -le 7 ]]; then
-        add_result 35_dlc_error FALLA "Errores en dlc.error" "Hay errores de conexion/TLS y el log se escribio hace $LOG_DIAS dia(s) (RECIENTE): $PATRONES"
+    if [[ "$LOG_DIAS" -ge 0 && "$LOG_DIAS" -le 7 ]]; then
+        add_result 35_dlc_error FALLA "Errores en dlc.error" "Hay errores de conexion/TLS y el log se escribio $LOG_EDAD (RECIENTE): $PATRONES"
     else
-        add_result 35_dlc_error INFO "Errores en dlc.error" "Hay patrones de error pero el log NO se escribe desde hace $LOG_DIAS dia(s): son errores ANTIGUOS, no necesariamente de la falla actual. Comparar fechas dentro de la evidencia."
+        add_result 35_dlc_error INFO "Errores en dlc.error" "Hay patrones de error pero la ultima escritura del log es $LOG_EDAD: son errores ANTIGUOS, no necesariamente de la falla actual. Comparar fechas dentro de la evidencia."
     fi
 else
-    add_result 35_dlc_error INFO "Errores en dlc.error" "Sin patrones de error de conexion en las ultimas 60 lineas (ultima escritura del log: hace $LOG_DIAS dia(s))."
+    add_result 35_dlc_error INFO "Errores en dlc.error" "Sin patrones de error de conexion en las ultimas 60 lineas (ultima escritura del log: $LOG_EDAD)."
 fi
 
 # 36 - CRLs cacheadas por el DLC (revocacion de la cadena del EP) -----------
@@ -1052,14 +1217,79 @@ if tiene jq || tiene python3; then
              echo \"JSON INVALIDO : \$f -> \$ERR\";
            fi;
          done"
+    # Sin archivos que revisar no hay nada que declarar valido: un OK aqui
+    # afirmaria que "todos los JSON son validos" en un servidor donde el
+    # directorio conf/ ni siquiera existe. Se aplica la regla del script:
+    # una prueba que no pudo ejecutarse se registra como FALLA.
+    JSON_N=$(salida 37_json | grep -cE '^JSON (VALIDO|LENIENT|INVALIDO)')
+    [[ -z "$JSON_N" ]] && JSON_N=0
     if salida 37_json | grep -q 'JSON INVALIDO'; then
         ARCHIVOS_INV=$(salida 37_json | grep 'JSON INVALIDO' | sed 's/JSON INVALIDO : //; s/ ->.*//' | tr '\n' ' ')
         add_result 37_json FALLA "Sintaxis JSON de la configuracion" "Archivo(s) con JSON invalido: $ARCHIVOS_INV. El servicio no puede cargar la configuracion ahi definida (correlacionar con MalformedJsonException en 35_dlc_error). La evidencia indica la linea exacta del defecto; corregir de forma controlada: respaldar el archivo, ajustar la sintaxis y reiniciar el servicio en ventana."
+    elif [[ "$JSON_N" -eq 0 ]]; then
+        no_ejecutada 37_json "Sintaxis JSON de la configuracion" "no se encontro ningun archivo .json en $DLC_HOME/conf (directorio inexistente, vacio o ilegible; ver 00_dlc y 00_configjson)"
     else
-        add_result 37_json OK "Sintaxis JSON de la configuracion" "Todos los archivos JSON de $DLC_HOME/conf son validos (los de formato lenient de fabrica quedan identificados en la evidencia y no constituyen defecto)."
+        add_result 37_json OK "Sintaxis JSON de la configuracion" "Los $JSON_N archivos JSON encontrados en $DLC_HOME/conf son validos (los de formato lenient de fabrica quedan identificados en la evidencia y no constituyen defecto)."
     fi
 else
     no_ejecutada 37_json "Sintaxis JSON de la configuracion" "faltan jq y python3"
+fi
+
+# 38 - Backlog del buffer de eventos en disco ------------------------------
+# Cuando el DLC no logra entregar a QRoC, no descarta: acumula en disco. Esa
+# acumulacion es la senal mas directa del deslinde y hasta ahora solo se
+# recolectaba para el paquete de soporte, sin evaluarse:
+#   crece  + salida rota  -> el DLC recibe y no entrega (falla de entrega)
+#   crece  + salida sana  -> entrega mas lento de lo que recibe
+#   se drena              -> la entrega esta recuperando el respaldo
+#   estancado con contenido -> ni acumula ni drena (correlacionar con 31)
+#   vacio                 -> no hay eventos pendientes
+# La segunda muestra se compara contra la tomada al entrar al bloque 4.
+if [[ ! -d "$BUFFER_DIR" ]]; then
+    add_result 38_buffer INFO "Backlog del buffer de eventos" "No existe $BUFFER_DIR: el DLC no ha creado el buffer de eventos en disco (instalacion que aun no procesa eventos, o ruta distinta en esta version). Sin evidencia de acumulacion."
+else
+    # Garantizar una ventana de observacion minima: si las pruebas 31-37 se
+    # omitieron por falta de comandos, el tiempo transcurrido puede ser de
+    # apenas unos segundos y la comparacion no significaria nada.
+    EVBUF_VENT=$(( $(date +%s) - EVBUF_T1 ))
+    if [[ "$EVBUF_VENT" -lt "$BUFFER_VENTANA_MIN" ]]; then
+        sleep $(( BUFFER_VENTANA_MIN - EVBUF_VENT ))
+        EVBUF_VENT=$(( $(date +%s) - EVBUF_T1 ))
+    fi
+    read -r EVBUF_B2 EVBUF_F2 <<<"$(muestra_buffer)"
+    EVBUF_DELTA=$(( EVBUF_B2 - EVBUF_B1 ))
+    EVBUF_HUM=$(numfmt --to=iec "$EVBUF_B2" 2>/dev/null || echo "$EVBUF_B2 bytes")
+    cap 38_buffer "Backlog del buffer de eventos en disco ($BUFFER_DIR, dos muestras)" \
+        "echo 'Ventana de observacion: ${EVBUF_VENT}s (tiempo transcurrido entre el inicio del bloque 4 y esta prueba)';
+         echo;
+         echo 'muestra 1: $EVBUF_B1 bytes en $EVBUF_F1 archivos';
+         echo 'muestra 2: $EVBUF_B2 bytes en $EVBUF_F2 archivos';
+         echo 'variacion: $EVBUF_DELTA bytes';
+         echo; echo '--- ocupacion del sistema de archivos que contiene el buffer:';
+         df -hP '$BUFFER_DIR' 2>/dev/null;
+         echo; echo '--- contenido de nivel superior del buffer:';
+         ls -l '$BUFFER_DIR' 2>/dev/null | head -20"
+    # Las pruebas de salida pueden figurar en FALLA por no haberse ejecutado
+    # (falta de tcpdump, por ejemplo). Se nombran las que fallaron para que
+    # el lector distinga una salida rota de una salida no verificada: el
+    # detalle de cada una indica si fue "PRUEBA NO EJECUTADA".
+    EVBUF_SALIDA_ROTA=""
+    for _t in 24_conexion 25_tls 32_saliente; do
+        [[ "${V[$_t]:-}" == FALLA ]] && EVBUF_SALIDA_ROTA="$EVBUF_SALIDA_ROTA $_t"
+    done
+    if [[ "$EVBUF_F2" -eq 0 ]]; then
+        add_result 38_buffer OK "Backlog del buffer de eventos" "El buffer $BUFFER_DIR esta vacio: no hay eventos pendientes de entrega hacia QRoC."
+    elif [[ "$EVBUF_DELTA" -gt 0 ]]; then
+        if [[ -n "$EVBUF_SALIDA_ROTA" ]]; then
+            add_result 38_buffer FALLA "Backlog del buffer de eventos" "El buffer CRECE ($EVBUF_HUM acumulados, +$EVBUF_DELTA bytes en ${EVBUF_VENT}s) y las pruebas de salida hacia QRoC estan en FALLA ($EVBUF_SALIDA_ROTA): el DLC recibe eventos y los acumula en disco sin entregarlos. Esto ubica la falla en la ENTREGA, no en la recepcion. Revisar en el detalle de esas pruebas si se trata de una salida efectivamente rota o de una prueba que no pudo ejecutarse. Vigilar la ocupacion de /store (05_disco): cuando el sistema de archivos se llena, los eventos se pierden de forma definitiva."
+        else
+            add_result 38_buffer ALERTA "Backlog del buffer de eventos" "El buffer CRECE ($EVBUF_HUM acumulados, +$EVBUF_DELTA bytes en ${EVBUF_VENT}s) aunque la salida hacia QRoC responde: la tasa de entrega es menor que la de recepcion. Puede corresponder a un pico de volumen o a un enlace saturado; repetir la medicion y vigilar la ocupacion de /store."
+        fi
+    elif [[ "$EVBUF_DELTA" -lt 0 ]]; then
+        add_result 38_buffer OK "Backlog del buffer de eventos" "El buffer se esta DRENANDO ($EVBUF_HUM restantes, $EVBUF_DELTA bytes en ${EVBUF_VENT}s): la entrega hacia QRoC avanza y el respaldo acumulado se esta recuperando."
+    else
+        add_result 38_buffer ALERTA "Backlog del buffer de eventos" "El buffer conserva contenido ($EVBUF_HUM en $EVBUF_F2 archivos) y NO varia en ${EVBUF_VENT}s: ni acumula ni drena. Correlacionar con 31_entrante (si no llegan eventos, el estancamiento es el resultado esperado y el hallazgo esta en los log sources) y con 33_jmx."
+    fi
 fi
 
 #=============================================================================
@@ -1091,12 +1321,30 @@ fi
 # 42 - Crypto-policies -----------------------------------------------------
 cap 42_crypto "Politica criptografica del sistema (RHEL 9)" \
     "update-crypto-policies --show 2>/dev/null; echo; ls -l /etc/crypto-policies/config 2>/dev/null"
-CPOL=$(head -5 "$EVID/42_crypto.txt" | grep -m1 -oE 'LEGACY|DEFAULT|FUTURE|FIPS[A-Z:]*' || true)
-case "${CPOL:-}" in
-    LEGACY)  add_result 42_crypto OK "Crypto-policies" "Politica LEGACY (mas permisiva)." ;;
-    DEFAULT) add_result 42_crypto INFO "Crypto-policies" "Politica DEFAULT: en RHEL 9 rechaza SHA-1 y TLS<1.2. Si 34_certs detecto SHA-1, correlacionar ambos hallazgos; la mitigacion documentada es 'update-crypto-policies --set DEFAULT:SHA1' (este script no la aplica)." ;;
-    FUTURE|FIPS*) add_result 42_crypto ALERTA "Crypto-policies" "Politica ${CPOL}: altamente restrictiva; puede rechazar el TLS del DLC. Verificar si fue modificada por el parcheo o por un proceso de hardening." ;;
-    *) no_ejecutada 42_crypto "Crypto-policies" "update-crypto-policies no disponible o sin salida" ;;
+# La politica puede llevar SUBPOLITICAS separadas por ':' y son ellas las que
+# deciden el sentido del veredicto: DEFAULT:SHA1 rehabilita SHA-1 (es la
+# mitigacion que este mismo informe recomienda) y DEFAULT:NO-SHA1 lo prohibe
+# de forma explicita. Quedarse solo con la base convierte a ambas en
+# "DEFAULT" e invierte la conclusion, ademas de sostener una hipotesis de
+# causa raiz SHA-1 en un servidor donde la mitigacion ya esta aplicada.
+CPOL=$(salida 42_crypto | grep -m1 -oE '^(LEGACY|DEFAULT|FUTURE|FIPS)(:[A-Za-z0-9_-]+)*' || true)
+CPOL_BASE="${CPOL%%:*}"
+CPOL_SUB="${CPOL#"$CPOL_BASE"}"; CPOL_SUB="${CPOL_SUB#:}"
+case "${CPOL_BASE:-}" in
+    LEGACY)
+        add_result 42_crypto OK "Crypto-policies" "Politica ${CPOL}: LEGACY es la mas permisiva; no restringe SHA-1 ni TLS 1.0/1.1." ;;
+    DEFAULT)
+        if [[ "$CPOL_SUB" == *NO-SHA1* ]]; then
+            add_result 42_crypto ALERTA "Crypto-policies" "Politica ${CPOL}: la subpolitica NO-SHA1 endurece DEFAULT y prohibe SHA-1 de forma explicita (hardening deliberado, no un valor de fabrica). Si 34_certs detecto certificados con firma SHA-1, esta politica es la causa directa del rechazo del TLS."
+        elif [[ "$CPOL_SUB" == *SHA1* ]]; then
+            add_result 42_crypto OK "Crypto-policies" "Politica ${CPOL}: la subpolitica SHA1 rehabilita SHA-1 sobre DEFAULT, es decir la mitigacion documentada YA esta aplicada en este servidor. Un certificado con firma SHA-1 no es causa de rechazo del TLS bajo esta politica: descartar esa hipotesis y buscar la causa en otro bloque."
+        else
+            add_result 42_crypto INFO "Crypto-policies" "Politica DEFAULT (sin subpoliticas): en RHEL 9 rechaza SHA-1 y TLS<1.2. Si 34_certs detecto SHA-1, correlacionar ambos hallazgos; la mitigacion documentada es 'update-crypto-policies --set DEFAULT:SHA1' (este script no la aplica)."
+        fi ;;
+    FUTURE|FIPS)
+        add_result 42_crypto ALERTA "Crypto-policies" "Politica ${CPOL}: altamente restrictiva; puede rechazar el TLS del DLC. Verificar si fue modificada por el parcheo o por un proceso de hardening." ;;
+    *)
+        no_ejecutada 42_crypto "Crypto-policies" "update-crypto-policies no disponible o sin salida" ;;
 esac
 
 # 43 - Paquetes DLC/Java tocados por el parche -----------------------------
@@ -1127,10 +1375,10 @@ if tiene tar && tiene gzip; then
         tar -cf "$SOPORTE/dlc.tar" /var/log/dlc 2>&1
         tar -rf "$SOPORTE/dlc.tar" "$DLC_HOME"/conf/* 2>&1
         ls -lsRa "$KEYSTORE_DIR/" > "$BUF/keystore_contents.txt" 2>&1
-        for file in $(find "$KEYSTORE_DIR" -name "*.crt" 2>/dev/null); do
+        while IFS= read -r file; do
             ls -l "$file" >> "$BUF/keystore_contents.txt"
             cat "$file"  >> "$BUF/keystore_contents.txt"
-        done
+        done < <(find "$KEYSTORE_DIR" -name "*.crt" 2>/dev/null)
         if [[ -x "$JMX_SH" ]] && systemctl is-active --quiet dlc 2>/dev/null; then
             timeout 60 "$JMX_SH" -p $JMX_PORT > "$BUF/mbeans.txt" 2>&1
         else
@@ -1163,44 +1411,44 @@ else
 fi
 
 #=============================================================================
-# BLOQUE 7 - Respaldo de configuracion (opcional, -b)
+# BLOQUE 7 - Respaldo de configuracion (parte de toda ejecucion)
 #=============================================================================
 BK_FILE=""
 seccion "BLOQUE 7 - Respaldo de configuracion del DLC"
-    CFG_BK_SH="$DLC_HOME/current/script/configBackup.sh"
-    mkdir -p /store/tmp 2>/dev/null
-    if [[ -x "$CFG_BK_SH" ]]; then
-        cap 51_respaldo "Respaldo de configuracion (configBackup.sh oficial de IBM)" \
-            "'$CFG_BK_SH' 2>&1 | tail -5"
-    else
-        cap 51_respaldo "Respaldo de configuracion (equivalente: mismas rutas del configBackup.sh oficial)" \
-            "BK=/store/tmp/dlc_config_backup_\$(date +%Y-%m-%dT%H-%M-%S).tar.gz;
-             tar -czf \"\$BK\" '$DLC_HOME/MKS' '$DLC_HOME/keystore' '$DLC_HOME/trusted_certificates' '$DLC_HOME/conf' /store/ec /etc/dlc/instance /etc/pki/ca-trust/source/anchors '$DLC_HOME/current/eventgnosis/config/' /etc/firewalld/zones /etc/firewalld/services/ 2>&1 | tail -3;
-             echo \"Configuration has been backed up to file \$BK\""
+CFG_BK_SH="$DLC_HOME/current/script/configBackup.sh"
+mkdir -p /store/tmp 2>/dev/null
+if [[ -x "$CFG_BK_SH" ]]; then
+    cap 51_respaldo "Respaldo de configuracion (configBackup.sh oficial de IBM)" \
+        "'$CFG_BK_SH' 2>&1 | tail -5"
+else
+    cap 51_respaldo "Respaldo de configuracion (equivalente: mismas rutas del configBackup.sh oficial)" \
+        "BK=/store/tmp/dlc_config_backup_\$(date +%Y-%m-%dT%H-%M-%S).tar.gz;
+         tar -czf \"\$BK\" '$DLC_HOME/MKS' '$DLC_HOME/keystore' '$DLC_HOME/trusted_certificates' '$DLC_HOME/conf' /store/ec /etc/dlc/instance /etc/pki/ca-trust/source/anchors '$DLC_HOME/current/eventgnosis/config/' /etc/firewalld/zones /etc/firewalld/services/ 2>&1 | tail -3;
+         echo \"Configuration has been backed up to file \$BK\""
+fi
+# Se toma el archivo EXACTO reportado por la ejecucion que acaba de
+# correr (linea "backed up to file" del configBackup oficial o del
+# equivalente); no se busca ningun respaldo preexistente en el servidor.
+BK_FILE=$(salida 51_respaldo | grep -m1 'backed up to file' | sed 's/.*backed up to file[[:space:]]*//; s/^ *//; s/ *$//')
+if [[ -n "$BK_FILE" && -s "$BK_FILE" ]]; then
+    # Mejora: nombre portable (los dos puntos son invalidos en Windows)
+    BK_SAFE="${BK_FILE//:/-}"
+    if [[ "$BK_SAFE" != "$BK_FILE" ]]; then
+        mv "$BK_FILE" "$BK_SAFE" && BK_FILE="$BK_SAFE"
     fi
-    # Se toma el archivo EXACTO reportado por la ejecucion que acaba de
-    # correr (linea "backed up to file" del configBackup oficial o del
-    # equivalente); no se busca ningun respaldo preexistente en el servidor.
-    BK_FILE=$(salida 51_respaldo | grep -m1 'backed up to file' | sed 's/.*backed up to file[[:space:]]*//; s/^ *//; s/ *$//')
-    if [[ -n "$BK_FILE" && -s "$BK_FILE" ]]; then
-        # Mejora: nombre portable (los dos puntos son invalidos en Windows)
-        BK_SAFE="${BK_FILE//:/-}"
-        if [[ "$BK_SAFE" != "$BK_FILE" ]]; then
-            mv "$BK_FILE" "$BK_SAFE" && BK_FILE="$BK_SAFE"
-        fi
-        BK_N=$(tar -tzf "$BK_FILE" 2>/dev/null | wc -l | tr -d ' ')
-        if [[ "$BK_N" -gt 0 ]]; then
-            # El respaldo forma parte del entregable global: se copia dentro
-            # del paquete del diagnostico y se conserva el original local.
-            mkdir -p "$OUTDIR/respaldo_config"
-            cp -p "$BK_FILE" "$OUTDIR/respaldo_config/" 2>/dev/null
-            add_result 51_respaldo OK "Respaldo de configuracion" "$BK_FILE ($(du -h "$BK_FILE" 2>/dev/null | awk '{print $1}'), $BK_N entradas verificadas con tar -tzf; incluye conf, keystore, MKS, anclas CA y firewalld). Incluido en el paquete final del diagnostico (respaldo_config/) y conservado el original en /store/tmp. IMPORTANTE: llevar el paquete final FUERA del servidor antes de iniciar la ventana de cambio."
-        else
-            add_result 51_respaldo FALLA "Respaldo de configuracion" "El archivo $BK_FILE existe pero no lista contenido valido (tar -tzf fallo): NO iniciar la ventana con este respaldo."
-        fi
+    BK_N=$(tar -tzf "$BK_FILE" 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$BK_N" -gt 0 ]]; then
+        # El respaldo forma parte del entregable global: se copia dentro
+        # del paquete del diagnostico y se conserva el original local.
+        mkdir -p "$OUTDIR/respaldo_config"
+        cp -p "$BK_FILE" "$OUTDIR/respaldo_config/" 2>/dev/null
+        add_result 51_respaldo OK "Respaldo de configuracion" "$BK_FILE ($(du -h "$BK_FILE" 2>/dev/null | awk '{print $1}'), $BK_N entradas verificadas con tar -tzf; incluye conf, keystore, MKS, anclas CA y firewalld). Incluido en el paquete final del diagnostico (respaldo_config/) y conservado el original en /store/tmp. IMPORTANTE: llevar el paquete final FUERA del servidor antes de iniciar la ventana de cambio."
     else
-        add_result 51_respaldo FALLA "Respaldo de configuracion" "La ejecucion del respaldo no reporto un archivo generado, o el archivo reportado no existe o esta vacio (ver evidencias/51_respaldo.txt). NO iniciar una ventana de cambio sin un respaldo verificado."
+        add_result 51_respaldo FALLA "Respaldo de configuracion" "El archivo $BK_FILE existe pero no lista contenido valido (tar -tzf fallo): NO iniciar la ventana con este respaldo."
     fi
+else
+    add_result 51_respaldo FALLA "Respaldo de configuracion" "La ejecucion del respaldo no reporto un archivo generado, o el archivo reportado no existe o esta vacio (ver evidencias/51_respaldo.txt). NO iniciar una ventana de cambio sin un respaldo verificado."
+fi
 
 #=============================================================================
 seccion "RESUMEN DE RESULTADOS"
@@ -1242,10 +1490,12 @@ concluir() {
     [[ "${V[12_java]:-}" == FALLA || "${V[12_java]:-}" == ALERTA ]] && c+=$'- POSIBLE EFECTO DEL PARCHEO: el Java requerido por DLC (IBM SDK 8) no se confirma; la actualizacion pudo reemplazarlo o modificar alternatives. Evidencia: 12_java, 43_paquetes.\n'
     # 2) Servicio
     [[ "${V[10_servicio]:-}" == FALLA ]] && c+=$'- El servicio dlc se encuentra detenido. Antes de reiniciarlo, conservar las evidencias (03, 11, 35): un reinicio sin diagnostico elimina la evidencia de la causa.\n'
+    [[ "${V[14_limites]:-}" == FALLA ]] && c+=$'- CAUSA PROBABLE A NIVEL DE SERVICIO: el proceso del DLC agoto (o esta por agotar) su limite de descriptores de archivo. En ese estado el servicio permanece activo pero deja de aceptar conexiones de los log sources y de abrir archivos del buffer, lo que produce exactamente el cuadro de "no llegan eventos" sin que systemd reporte falla alguna. Evidencia: 14_limites.\n'
     # 3) Red de salida
     if [[ "${V[24_conexion]:-}" == FALLA || "${V[20_red]:-}" == FALLA || "${V[21_dns]:-}" == FALLA ]]; then
         c+=$'- SALIDA HACIA QROC ROTA: el SO no logra conectar al EP:32500 (ruta/DNS/firewall perimetral). La traza de 27_traceroute muestra el ultimo salto que responde (donde se corta). Verificar tambien el allowlist de QRoC con la IP publica de 26_ip_publica.\n'
     fi
+    [[ "${V[28_proxy]:-}" == ALERTA ]] && c+=$'- ADVERTENCIA DE INTERPRETACION: curl y el DLC no salen por la misma ruta (28_proxy). Los resultados de 26_ip_publica y 36_crl describen la salida de curl, de modo que un resultado correcto en esas pruebas NO descarta un bloqueo sobre el trafico del DLC. Resolver esta divergencia antes de dar por concluido el deslinde de red.\n'
     [[ "${V[21_dns]:-}" == ALERTA ]] && c+=$'- DNS NO COINCIDE con las IPs esperadas (21_dns): confirmar con IBM un posible cambio de IPs de los EP antes de aplicar modificaciones; no agregar entradas a /etc/hosts sin validacion.\n'
     # 4) TLS / certificados / crypto
     if [[ "${V[24_conexion]:-}" == OK && ( "${V[25_tls]:-}" == FALLA || "${V[34_certs]:-}" == FALLA ) ]]; then
@@ -1253,7 +1503,7 @@ concluir() {
     fi
     [[ "${V[36_crl]:-}" == FALLA ]] && c+=$'- HIPOTESIS PRINCIPAL: CRL cacheada vencida (36_crl, correlacionar con Q1CRLExpiredException en 35_dlc_error). El DLC no puede crear el contexto TLS hacia QRoC aunque red, handshake externo y certificados de cliente se observen correctos. Acciones controladas sugeridas: habilitar salida HTTP/80 hacia los puntos de distribucion de CRL del emisor del EP y depurar el cache de conf/cached_crl con reinicio del servicio en ventana autorizada.\n'
     [[ "${V[37_json]:-}" == FALLA ]] && c+=$'- CONFIGURACION JSON INVALIDA (37_json): el config store no puede cargar los archivos afectados (MalformedJsonException en el arranque, ver 35_dlc_error); los log sources definidos en ellos no operan. Corregir la sintaxis en la linea indicada por la evidencia, con respaldo previo y reinicio del servicio en ventana.\n'
-    [[ "${V[34_certs]:-}" == ALERTA && "${V[42_crypto]:-}" != OK ]] && c+=$'- CORRELACION SHA-1: existen certificados con firma SHA-1 y la politica criptografica de RHEL 9 no es LEGACY; la politica DEFAULT rechaza SHA-1 en TLS. Hipotesis principal de causa raiz tras un parcheo.\n'
+    [[ "${V[34_certs]:-}" == ALERTA && "${V[42_crypto]:-}" != OK ]] && c+=$'- CORRELACION SHA-1: existen certificados con firma SHA-1 y la politica criptografica vigente no habilita SHA-1 (ver la politica exacta, con sus subpoliticas, en 42_crypto). Hipotesis principal de causa raiz tras un parcheo o un endurecimiento. Si 42_crypto reporta OK por una subpolitica SHA1 ya aplicada, esta correlacion no aparece y la causa debe buscarse en otro bloque.\n'
     # 5) Deslinde entrada/salida
     if [[ "${V[31_entrante]:-}" == FALLA && "${V[22_firewall]:-}" == OK ]]; then
         c+=$'- NO LLEGAN EVENTOS AL SERVIDOR y el firewall local esta bien: el problema esta EN LOS LOG SOURCES o en la red del cliente, no en este SO.\n'
@@ -1264,6 +1514,8 @@ concluir() {
     if [[ "${V[33_jmx]:-}" == OK && "${V[32_saliente]:-}" == FALLA ]]; then
         c+=$'- EL DLC PROCESA PERO NO TRANSMITE: los contadores crecen sin paquetes salientes; el problema corresponde al DLC/TLS local (certificados, configuracion), no al SO base.\n'
     fi
+    [[ "${V[38_buffer]:-}" == FALLA ]] && c+=$'- CONFIRMACION DEL DESLINDE POR EL BUFFER EN DISCO (38_buffer): el respaldo de eventos crece mientras la salida hacia QRoC esta rota. El DLC si esta recibiendo y conservando los eventos; la falla esta en la ENTREGA. Riesgo asociado: cuando el sistema de archivos del buffer se llene, los eventos acumulados se perderan de forma definitiva (vigilar 05_disco).\n'
+    [[ "${V[38_buffer]:-}" == ALERTA && "${V[31_entrante]:-}" == FALLA ]] && c+=$'- El buffer de eventos no varia y tampoco llegan eventos al servidor (38_buffer con 31_entrante): el estancamiento del buffer es consecuencia de la falta de entrada, no de un problema de entrega. El hallazgo se ubica en los log sources.\n'
     if [[ "${V[31_entrante]:-}" == OK && "${V[32_saliente]:-}" == OK && "${V[33_jmx]:-}" == OK ]]; then
         c+=$'- Entrada, procesamiento y salida se observan correctos desde este servidor. Si QRoC continua sin recibir eventos, el deslinde apunta al lado QRoC (allowlist, log source/listener 32500): abrir un caso con IBM Support adjuntando este informe.\n'
     fi
@@ -1360,7 +1612,7 @@ cat <<HTMLFOOT
  <li><b>soporte_ibm/dlc.tar.gz</b> &mdash; paquete oficial para IBM Support (TechNote 7274013), listo para adjuntar a un caso.</li>
 $( [[ -n "${BK_FILE:-}" ]] && echo ' <li><b>respaldo_config/</b> &mdash; respaldo de configuracion del DLC (configBackup oficial o equivalente), verificado con tar -tzf.</li>' )
 </ul>
-<p class="pie">Generado por dlc_diagnostico_so.sh (solo lectura, sin cambios al sistema). Los enlaces de evidencia funcionan al abrir el HTML desde el paquete descomprimido.<br>
+<p class="pie">Generado por dlc_diagnostico_so.sh v$VERSION (solo lectura, sin cambios al sistema). Los enlaces de evidencia funcionan al abrir el HTML desde el paquete descomprimido.<br>
 AVISO: este script no cuenta con soporte oficial de IBM. Herramienta de diagnostico de campo elaborada por lrodriguezd@outlook.com.</p>
 </body>
 </html>

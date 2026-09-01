@@ -9,7 +9,8 @@ Script de diagnóstico en bash para instancias de **IBM Disconnected Log Collect
 - **Sin cambios al sistema**: no reinicia servicios ni modifica configuración, firewall o certificados. Escrituras legítimas: una prueba de 4 KB en `/store` (O_DIRECT/fsync, se elimina al terminar) y el archivo de respaldo de configuración en `/store/tmp`.
 - **Respaldo de configuración en cada ejecución** (prueba 51): usa el `configBackup.sh` oficial de IBM (o un equivalente con las mismas rutas), verifica el contenido con `tar -tzf`, normaliza el nombre a formato portable y lo integra al paquete final (`respaldo_config/`).
 - **Veredictos accionables**: cada prueba concluye OK / FALLA / ALERTA / INFO. Una prueba que no puede ejecutarse (comando faltante) se marca FALLA como "no ejecutada" — un diagnóstico incompleto también es un hallazgo.
-- **Evidencia completa**: un archivo `.txt` por prueba con el comando ejecutado, la fecha y la salida cruda.
+- **Evidencia completa**: un archivo `.txt` por prueba con el comando ejecutado, la fecha y la salida cruda. El `tls.keystorepassword` se sustituye por `***OCULTO***` tanto en el comando mostrado como en la salida capturada.
+- **Informes versionados**: el informe y el HTML llevan la versión del script (`-V`), de modo que un resultado siempre puede atribuirse a la versión que lo produjo.
 - **Informe en texto y HTML** con análisis cruzado final que indica a qué capa apunta la evidencia.
 - **Paquete para IBM Support** conforme a la TechNote 7274013, listo para adjuntar a un caso.
 - Todo se empaqueta en un único `.tgz` en `/tmp` y el directorio de trabajo se elimina.
@@ -17,7 +18,7 @@ Script de diagnóstico en bash para instancias de **IBM Disconnected Log Collect
 ## Requisitos
 
 - Ejecutar como **root** en el host del DLC.
-- RHEL/CentOS con `bash` 4+. Comandos requeridos (el bloque 0 los inventaría y reporta faltantes): `systemctl journalctl ss ip getent firewall-cmd tcpdump openssl curl findmnt rpm dnf tar gzip dd traceroute`, y opcionales `jq dig tcptraceroute mtr chronyc netstat`.
+- RHEL/CentOS con `bash` 4+. Comandos requeridos (el bloque 0 los inventaría y reporta faltantes): `systemctl journalctl ss ip getent firewall-cmd tcpdump openssl curl findmnt rpm dnf tar gzip du find dd traceroute`, y opcionales `jq dig tcptraceroute mtr chronyc netstat numfmt`.
 
 ## Modos de ejecución
 
@@ -46,6 +47,7 @@ sudo ./dlc_diagnostico_so.sh \
 | `-p <puerto>` | Puerto destino manual (prioridad sobre config.json) |
 | `-P <puerto>` | Puerto esperado para la comparación (por defecto 32500; en QRoC no debe cambiarse) |
 | `-h` | Ayuda |
+| `-V` | Versión del script (queda impresa en el informe y en el HTML) |
 
 ## Pruebas incluidas
 
@@ -53,9 +55,9 @@ sudo ./dlc_diagnostico_so.sh \
 |---|---|
 | 0 — Prerequisitos | Comandos disponibles, instalación DLC presente |
 | 1 — Sistema operativo | Uptime/reinicios, memoria, OOM killer, carga, disco e inodos, montaje y **escritura efectiva en /store**, errores XFS/E-S, hora/NTP |
-| 2 — Servicio DLC | Estado systemd, historial de caídas, Java (IBM SDK), puertos en escucha |
-| 3 — Red y firewall | Interfaces/rutas, DNS vs IPs esperadas, firewalld (514 y forward 514→1514), SELinux (denegaciones AVC), conexión TCP al EP, **handshake TLS (`openssl s_client -showcerts -verify 32`)**, IP pública IPv4 por dos canales, traza TCP al puerto (tcptraceroute/traceroute -T/mtr) |
-| 4 — Frontera DLC | config.json, **coherencia esperado-configurado-resuelto**, tráfico entrante/saliente (tcpdump), contadores JMX en dos muestras, **certificados: vigencia, cadena (raíz/intermedio deducidos por hash de emisor), correspondencia con el PFX en uso, CAs aceptadas por el EP y cumplimiento del procedimiento de instalación (pasos 1–5)**, log de errores con antigüedad, **CRLs cacheadas y capacidad de refresco HTTP/80**, validación JSON de la configuración (con clasificación de archivos de fábrica en formato tolerante) |
+| 2 — Servicio DLC | Estado systemd, historial de caídas, Java (IBM SDK), puertos en escucha, **descriptores de archivo del proceso contra el límite `nofile`** |
+| 3 — Red y firewall | Interfaces/rutas, DNS vs IPs esperadas, firewalld (514 y forward 514→1514), SELinux (denegaciones AVC), conexión TCP al EP, **handshake TLS (`openssl s_client -showcerts -verify 32`)**, IP pública IPv4 por dos canales, traza TCP al puerto (tcptraceroute/traceroute -T/mtr), **proxy del entorno: qué ruta usa `curl` y cuál la JVM del DLC** |
+| 4 — Frontera DLC | config.json, **coherencia esperado-configurado-resuelto**, tráfico entrante/saliente (tcpdump), contadores JMX en dos muestras, **certificados: vigencia, cadena (raíz/intermedio deducidos por hash de emisor), correspondencia con el PFX en uso, CAs aceptadas por el EP y cumplimiento del procedimiento de instalación (pasos 1–5)**, log de errores con antigüedad, **CRLs cacheadas y capacidad de refresco HTTP/80**, validación JSON de la configuración (con clasificación de archivos de fábrica en formato tolerante), **backlog del buffer de eventos en `/store/ec` en dos muestras (crece / se drena / estancado)** |
 | 5 — Post-parcheo | Historial dnf con versiones antes/después, kernel corriendo vs instalado, crypto-policies de RHEL 9, paquetes sensibles modificados (60 días) |
 | 6 — Soporte | Paquete oficial para IBM Support (TechNote 7274013) |
 
