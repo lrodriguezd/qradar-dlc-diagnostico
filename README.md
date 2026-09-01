@@ -18,7 +18,7 @@ Script de diagnóstico en bash para instancias de **IBM Disconnected Log Collect
 ## Requisitos
 
 - Ejecutar como **root** en el host del DLC.
-- RHEL/CentOS con `bash` 4+. Comandos requeridos (el bloque 0 los inventaría y reporta faltantes): `systemctl journalctl ss ip getent firewall-cmd tcpdump openssl curl findmnt rpm dnf tar gzip du find dd traceroute`, y opcionales `jq dig tcptraceroute mtr chronyc netstat numfmt`.
+- RHEL/CentOS con `bash` 4+. Comandos requeridos (el bloque 0 los inventaría y reporta faltantes): `systemctl journalctl ss ip getent firewall-cmd tcpdump openssl curl findmnt rpm dnf tar gzip awk sed grep df du find free timeout dd traceroute`, y opcionales `jq ausearch chronyc netstat alternatives dig tcptraceroute numfmt`.
 
 ## Modos de ejecución
 
@@ -61,6 +61,24 @@ sudo ./dlc_diagnostico_so.sh \
 | 5 — Post-parcheo | Historial dnf con versiones antes/después, kernel corriendo vs instalado, crypto-policies de RHEL 9, paquetes sensibles modificados (60 días) |
 | 6 — Soporte | Paquete oficial para IBM Support (TechNote 7274013) |
 
+### Cómo se leen las tres pruebas de deslinde
+
+La prueba **38 (`38_buffer`)** es la que ubica la falla de un lado u otro de la frontera. Cuando el DLC no logra entregar a QRoC no descarta: acumula en `/store/ec`. El script toma dos muestras separadas por el tiempo real que consumen las pruebas 31–37 y compara:
+
+| Buffer de eventos | Salida hacia QRoC | Veredicto | Lectura |
+|---|---|---|---|
+| Vacío | — | OK | No hay eventos pendientes de entrega. |
+| **Crece** | Rota (24, 25 o 32 en FALLA) | **FALLA** | El DLC **recibe y no entrega**: la falla está en la entrega, no en la recepción. |
+| **Crece** | Responde | ALERTA | Entrega más lento de lo que recibe: pico de volumen o enlace saturado. |
+| Se drena | — | OK | La entrega avanza y recupera el respaldo acumulado. |
+| Con contenido, sin variar | — | ALERTA | Ni acumula ni drena. Cruzar con 31: si tampoco llegan eventos, el hallazgo está en los log sources. |
+
+El veredicto FALLA nombra cuáles pruebas de salida fallaron, para distinguir una salida efectivamente rota de una que no pudo verificarse por falta de un comando. **Riesgo asociado**: cuando el sistema de archivos del buffer se llena, los eventos acumulados se pierden de forma definitiva — vigilar la prueba 05.
+
+La prueba **28 (`28_proxy`)** condiciona la lectura de las pruebas 26 y 36: ambas miden con `curl`, que honra `http_proxy`/`https_proxy`, mientras que la JVM del DLC los ignora y solo usa proxy si recibe `-Dhttp.proxyHost`/`-Dhttps.proxyHost`. Si las dos rutas difieren, **un resultado correcto en 26 y 36 no descarta un bloqueo perimetral sobre el tráfico del DLC**, y la IP que debe figurar en el allowlist de QRoC no es necesariamente la que reporta la prueba 26.
+
+La prueba **14 (`14_limites`)** cubre un modo de falla que se confunde con un problema de red: al agotar el límite `nofile`, el proceso del DLC deja de aceptar conexiones y de abrir archivos **sin detenerse**. `systemctl status` lo muestra activo mientras ya no recibe ni entrega. El límite que aplica es el de la unidad systemd (`LimitNOFILE`); systemd ignora `/etc/security/limits.conf` para los servicios.
+
 ## Uso en ventanas de actualización del servidor
 
 **Antes de la ventana** — una sola ejecución genera la línea base y el respaldo verificado (el respaldo forma parte de toda ejecución):
@@ -80,6 +98,7 @@ El respaldo de configuración verificado queda **incluido dentro del `.tgz` del 
   ├── informe.txt        # informe completo con resumen, hallazgos y conclusión
   ├── informe.html       # informe preliminar navegable (tabla por veredicto)
   ├── evidencias/        # un .txt por prueba (comando + salida cruda)
+  ├── respaldo_config/   # respaldo de configuración verificado (si la prueba 51 lo validó)
   └── soporte_ibm/dlc.tar.gz   # paquete para caso de soporte IBM
 ```
 
@@ -90,6 +109,10 @@ El respaldo de configuración verificado queda **incluido dentro del `.tgz` del 
 - **Disco de `/store` desconectado de la VM**: el permiso de escritura se veía bien pero nada persistía → prueba de escritura efectiva con O_DIRECT/fsync (06b).
 - **CRL cacheada vencida** (`Q1CRLExpiredException`): tras la rotación de intermedios del emisor del EP, una CRL en `conf/cached_crl/` quedó vencida e irrecuperable y abortaba la creación del contexto TLS aunque red, handshake y certificados de cliente estuvieran correctos → prueba 36.
 - **`logSources.json` malformado por edición manual** (coma sobrante): `MalformedJsonException` en el arranque e impedía cargar los log sources → prueba 37 con `jq`.
+
+## Versiones
+
+El historial de cambios está en [CHANGELOG.md](CHANGELOG.md). La versión se consulta con `-V` y queda impresa en el informe y en el HTML: **al comparar un informe contra una línea base anterior, verifique que ambos provengan de la misma versión** — los veredictos cambian de significado entre versiones.
 
 ## Licencia y contribuciones
 
